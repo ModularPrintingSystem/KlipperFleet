@@ -74,13 +74,8 @@ class ConfigPreview(BaseModel):
     profile: Optional[str] = None
     values: List[ConfigValue] = []
 
-@app.get("/config/tree")
-async def get_config_tree(request: Request, profile: Optional[str] = None):
-    """Returns the full Kconfig tree, optionally loaded with a profile's values."""
-    return await post_config_tree(ConfigPreview(profile=profile), request)
-
 @app.post("/config/tree")
-async def post_config_tree(preview: ConfigPreview, request: Request):
+async def post_config_tree(preview: ConfigPreview, request: Request) -> List[Dict[str, Any]]:
     """Returns the Kconfig tree with unsaved values applied for live preview."""
     config_path = None
     if preview.profile:
@@ -104,6 +99,11 @@ async def post_config_tree(preview: ConfigPreview, request: Request):
         import traceback
         error_detail = traceback.format_exc()
         raise HTTPException(status_code=500, detail=error_detail)
+
+@app.get("/config/tree")
+async def get_config_tree(request: Request, profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns the full Kconfig tree, optionally loaded with a profile's values."""
+    return await post_config_tree(ConfigPreview(profile=profile), request)
 
 @app.post("/config/save")
 async def save_profile(profile: ProfileSave):
