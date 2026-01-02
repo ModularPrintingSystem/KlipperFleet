@@ -60,6 +60,8 @@ class Device(BaseModel):
     profile: str
     method: str
     notes: Optional[str] = ""
+    is_katapult: bool = False
+    is_bridge: bool = False
 
 class FlashRequest(BaseModel):
     profile: str
@@ -206,10 +208,16 @@ async def batch_operation(action: str):
                 if action == "build-flash-all" or action == "flash-all":
                     yield ">>> Checking for devices in service that need rebooting to Katapult...\n"
                     for dev in devices:
-                        if not dev['profile']:
+                        if not dev.get('profile'):
                             continue
+                        
+                        # Skip bridge hosts for now, they must stay in service to flash others
+                        if dev.get('is_bridge'):
+                            continue
+                            
                         status = await flash_mgr.check_device_status(dev['id'], dev['method'])
-                        if status == "service" and dev['method'] in ["can", "serial"]:
+                        # Only reboot if it's in service AND marked as a Katapult device
+                        if status == "service" and dev.get('is_katapult'):
                             reboot_tasks.append({"id": dev['id'], "method": dev['method'], "name": dev['name']})
                 
                 # Now stop services to clear the bus
@@ -243,11 +251,14 @@ async def batch_operation(action: str):
                         yield ">>> Timeout reached. Some devices may not have entered Katapult mode.\n"
 
                 # 2b. Actual flashing
-                for dev in devices:
-                    if not dev['profile']:
+                # Sort devices: Non-bridges first, Bridges last
+                sorted_devices = sorted(devices, key=lambda x: 1 if x.get('is_bridge') else 0)
+                
+                for dev in sorted_devices:
+                    if not dev.get('profile'):
                         continue
                     
-                    # Check status if "ready" is specified
+                    # Check status
                     status = await flash_mgr.check_device_status(dev['id'], dev['method'])
                     
                     should_flash = False
@@ -257,6 +268,15 @@ async def batch_operation(action: str):
                         should_flash = True
                     
                     if should_flash:
+                        # If it's a bridge host and we need to flash it, we might need to reboot it first
+                        # but only AFTER all other devices are done.
+                        if dev.get('is_bridge') and status == "service" and dev.get('is_katapult'):
+                            yield f">>> Rebooting Bridge Host {dev['name']} to Katapult...\n"
+                            async for log in flash_mgr.reboot_to_katapult(dev['id'], dev['method']):
+                                yield log
+                            await asyncio.sleep(5) # Wait for bridge to come back in bootloader
+                            status = await flash_mgr.check_device_status(dev['id'], dev['method'])
+
                         if status != "ready" and dev['method'] != "linux":
                             yield f"!!! Skipping {dev['name']} ({dev['id']}) - Device is {status}, not ready for flashing.\n"
                             continue
@@ -291,8 +311,8 @@ async def batch_operation(action: str):
             if "flash" in action:
                 yield ">>> Returning to service...\n"
                 for dev in devices:
-                    if dev['method'] == "can" and dev['profile']:
-                        async for _ in flash_mgr.reboot_device(dev['id'], mode="service"):
+                    if dev.get('profile') and dev.get('is_katapult'):
+                        async for _ in flash_mgr.reboot_device(dev['id'], mode="service", method=dev['method']):
                             pass
         finally:
             if "flash" in action:

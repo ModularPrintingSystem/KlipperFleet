@@ -13,6 +13,8 @@ KlipperFleet is a "one-stop-shop" for managing Klipper firmware across your enti
 
 - **Dynamic Web Configurator**: Replaces `make menuconfig` with a reactive web form that parses Klipper's source code in real-time.
 - **Fleet Management**: Register all your MCUs (Serial or CAN), assign them profiles, and manage them from a single dashboard.
+- **Smart Sequencing**: Automatically handles CAN bridge hosts by flashing downstream nodes first, then the bridge host last.
+- **UART Support**: Detects and manages MCUs connected via Raspberry Pi UART (GPIO) (You know katapult supports UART and USB devices now, right?)
 - **One-Click Batch Operations**: Build firmware for your entire fleet, flash all ready devices, or perform a full "Build & Flash All" with a single click.
 - **Automatic Katapult Reboot**: Intelligent detection of Klipper vs. Katapult modes. If a device is in service, KlipperFleet can automatically reboot it into Katapult mode for flashing.
 - **Service Management**: Automatically stops and starts Klipper/Moonraker services during flashing to ensure exclusive access to the CAN bus, preventing "Request Block" errors.

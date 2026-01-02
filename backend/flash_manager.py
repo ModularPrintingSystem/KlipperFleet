@@ -191,17 +191,18 @@ class FlashManager:
             return "ready" if os.path.exists("/tmp/klipper_host_mcu") else "offline"
         return "unknown"
 
-    async def reboot_device(self, uuid: str, mode: str = "katapult", interface: str = "can0") -> AsyncGenerator[str, None]:
+    async def reboot_device(self, device_id: str, mode: str = "katapult", method: str = "can", interface: str = "can0") -> AsyncGenerator[str, None]:
         """Reboots a device, either to Katapult or a regular reboot."""
         if mode == "katapult":
-            async for line in self.reboot_to_katapult(uuid, method="can", interface=interface):
+            async for line in self.reboot_to_katapult(device_id, method=method, interface=interface):
                 yield line
         else:
-            yield f">>> Requesting regular reboot for {uuid}...\n"
-            # Regular reboot (Return to Service)
-            # We send a Katapult 'COMPLETE' command to jump to the application.
-            # This requires assigning a temporary node ID first.
-            py_cmd = f"""
+            if method == "can":
+                yield f">>> Requesting regular reboot for {device_id}...\n"
+                # Regular reboot (Return to Service)
+                # We send a Katapult 'COMPLETE' command to jump to the application.
+                # This requires assigning a temporary node ID first.
+                py_cmd = f"""
 import socket
 import struct
 import time
@@ -224,7 +225,7 @@ def send_can(id, data):
     except Exception as e:
         print(f"Socket error: {{e}}")
 
-uuid_bytes = bytes.fromhex("{uuid}")
+uuid_bytes = bytes.fromhex("{device_id}")
 
 # 1. Set Node ID to 0x200 (index 128)
 # Katapult Admin ID is always 0x3f0
@@ -238,16 +239,20 @@ cmd_body = bytes([0x15, 0x00])
 crc = crc16_ccitt(cmd_body)
 pkt = bytes([0x01, 0x88]) + cmd_body + struct.pack("<H", crc) + bytes([0x99, 0x03])
 send_can(0x200, pkt)
-print("Jump command sent to UUID {uuid}")
+print("Jump command sent to UUID {device_id}")
 """
-            process = await asyncio.create_subprocess_exec(
-                "python3", "-c", py_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
-            stdout, _ = await process.communicate()
-            yield stdout.decode()
-            yield ">>> Regular reboot command sent.\n"
+                process = await asyncio.create_subprocess_exec(
+                    "python3", "-c", py_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+                stdout, _ = await process.communicate()
+                yield stdout.decode()
+                yield ">>> Regular reboot command sent.\n"
+            else:
+                # For serial, we can try sending the reboot command via flashtool
+                # but usually serial devices jump to app after flash or timeout.
+                yield f">>> Serial device {device_id} will return to service after flash or timeout.\n"
 
     async def reboot_to_katapult(self, device_id: str, method: str = "can", interface: str = "can0") -> AsyncGenerator[str, None]:
         """Sends a reboot command to a device to enter Katapult."""
