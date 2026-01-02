@@ -371,7 +371,7 @@ async def save_device(device: Device):
     fleet_mgr.save_device(device.dict())
     return {"message": "Device saved to fleet"}
 
-@app.delete("/fleet/device/{device_id}")
+@app.delete("/fleet/device")
 async def remove_device(device_id: str):
     """Removes a device from the fleet."""
     fleet_mgr.remove_device(device_id)

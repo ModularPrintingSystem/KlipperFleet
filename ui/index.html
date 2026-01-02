@@ -681,8 +681,16 @@
 
                 const removeDeviceFromFleet = async (id) => {
                     if (!confirm("Remove this device from your fleet?")) return;
-                    await fetch(`/fleet/device/${id}`, { method: 'DELETE' });
-                    fetchFleet();
+                    try {
+                        const res = await fetch(`/fleet/device?device_id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+                        if (!res.ok) {
+                            const data = await res.json();
+                            throw new Error(data.detail || "Failed to remove device");
+                        }
+                        fetchFleet();
+                    } catch (e) {
+                        alert("Error: " + e.message);
+                    }
                 };
 
                 const selfUpdate = async () => {
