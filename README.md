@@ -1,8 +1,10 @@
 # KlipperFleet
 
 > [!WARNING]
-> **ALPHA SOFTWARE**: KlipperFleet is currently in alpha. It has only been extensively tested on **CAN bus** and **Linux Process** devices. 
+> **ALPHA SOFTWARE**: KlipperFleet is currently in alpha. It has only been extensively tested on **CAN bus** and **Linux Process** devices.
 >
+> **Kalico and Fluidd Users**: Be advised these are unsupported at the moment, but both on the roadmap for integration.
+> 
 > **USB and DFU flashing are currently in active development.** While the build system is fully functional, automated USB/DFU flashing is being refined in the `dev` branch and will be available in the next major update. You can still use KlipperFleet to compile your firmware and download the binaries for manual flashing.
 >
 > Contributions and bug reports are highly appreciated!
