@@ -3,7 +3,7 @@
 > [!WARNING]
 > **ALPHA SOFTWARE**: KlipperFleet is currently in alpha. It has only been extensively tested on **CAN bus** and **Linux Process** devices. 
 >
-> **Katapult USB flashing and standard USB flashing are currently untested.** However, the build system is fully functional, so you can still use KlipperFleet to compile your firmware and download the binaries for manual flashing.
+> **USB and DFU flashing are currently in active development.** While the build system is fully functional, automated USB/DFU flashing is being refined in the `dev` branch and will be available in the next major update. You can still use KlipperFleet to compile your firmware and download the binaries for manual flashing.
 >
 > Contributions and bug reports are highly appreciated!
 
@@ -121,5 +121,20 @@ KlipperFleet stores its data in `~/printer_data/config/klipperfleet/`:
 - `artifacts/`: Compiled `.bin` and `.elf` firmware files.
 - `fleet.json`: Registry of your devices and their assigned profiles.
 
+## Planned For and Upcoming Features
+
+KlipperFleet is under active development. Here are some of the major features currently in the works:
+
+- **Safety & Robustness**:
+  - **Architecture Verification**: Automatic safety checks to verify MCU architecture before flashing.
+  - **Enhanced DFU Handling**: Improved robustness for STM32 DFU mode entry and exit (currently in testing).
+  - **Bridge Recovery**: Intelligent interface recovery and status detection for CAN bridge hosts.
+  - **kconfiglib**: Switch to using klipper's kconfiglib instead of the official kconfiglib to ensure accuracy during builds.
+- **User Experience**:
+  - **One-Click UI Updates**: Integration with Moonraker's update manager for updates directly from the KlipperFleet dashboard.
+  - **Custom Modal System**: Replacing browser prompts with a native-feeling UI for a smoother experience.
+- **Ecosystem Expansion**: Eventual Additions.
+  - **Kalico Support**: Compatibility for Kalico firmware and configuration.
+  - **Fluidd Integration**: Seamless integration and UI parity for Fluidd users.
 ## License
 GPLv3
