@@ -237,29 +237,36 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks):
                 initial_serials = [d['id'] for d in await flash_mgr.discover_serial_devices(skip_moonraker=True)]
 
                 task_store.add_log(task_id, ">>> Checking device statuses...\n")
+                
+                # Pre-discover CAN devices once to avoid redundant slow scans
+                can_discovery = await flash_mgr.discover_can_devices()
+                can_status_map = {d['id']: d.get('mode', 'offline') for d in can_discovery}
+                
                 reboot_tasks = []
                 device_statuses = {}
                 for dev in devices:
                     if not dev.get('profile'):
                         continue
-                    status = await flash_mgr.check_device_status(dev['id'], dev['method'])
+                    
+                    # Use cached CAN status if possible
+                    if dev['method'] == 'can':
+                        status = can_status_map.get(dev['id'], 'offline')
+                    else:
+                        status = await flash_mgr.check_device_status(dev['id'], dev['method'])
+                    
                     device_statuses[dev['id']] = status
                     
                     if status == "service":
-                        # If it's not a bridge, we can reboot it now
-                        if not dev.get('is_bridge') and (dev.get('is_katapult') or dev['method'] == 'can'):
+                        # Reboot non-bridge CAN devices and non-bridge Katapult-capable serial devices.
+                        # Bridges are handled in the second phase to avoid killing the CAN bus prematurely.
+                        if not dev.get('is_bridge') and (dev['method'] == 'can' or dev.get('is_katapult')):
                             reboot_tasks.append({"id": dev['id'], "method": dev['method'], "name": dev['name']})
                 
                 if reboot_tasks:
-                    task_store.add_log(task_id, ">>> Triggering Firmware Restart to enter bootloader mode...\n")
-                    await flash_mgr.trigger_firmware_restart()
+                    # Now stop services to clear the bus
+                    task_store.add_log(task_id, await manage_klipper_services("stop"))
                     await asyncio.sleep(2) 
-
-                # Now stop services to clear the bus
-                task_store.add_log(task_id, await manage_klipper_services("stop"))
-                await asyncio.sleep(2) 
-                
-                if reboot_tasks:
+                    
                     for dev_info in reboot_tasks:
                         task_store.add_log(task_id, f">>> Requesting Katapult reboot for {dev_info['name']} ({dev_info['id']})...\n")
                         async for log in flash_mgr.reboot_to_katapult(dev_info['id'], dev_info['method'], is_bridge=False):
@@ -268,6 +275,15 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks):
                     task_store.add_log(task_id, ">>> Waiting for devices to enter Katapult mode (up to 30s)...\n")
                     for i in range(15): 
                         await asyncio.sleep(2)
+                        
+                        # Check if CAN interface is still up
+                        if not await flash_mgr.is_interface_up("can0"):
+                            task_store.add_log(task_id, "!!! CAN interface (can0) is DOWN. A bridge may have rebooted unexpectedly.\n")
+                            # If we are waiting for CAN devices, this is a problem
+                            if any(d['method'] == 'can' for d in reboot_tasks):
+                                task_store.add_log(task_id, ">>> Attempting to bring can0 back up...\n")
+                                await flash_mgr.ensure_canbus_up("can0")
+
                         ready_count = 0
                         for dev_info in reboot_tasks:
                             status = await flash_mgr.check_device_status(dev_info['id'], dev_info['method'])

@@ -319,65 +319,20 @@ print("Jump command sent to UUID {device_id}")
         yield f">>> Requesting reboot to Katapult for {device_id}...\n"
         method = method.lower()
         if method == "can":
-            # For bridges, flashtool.py -r is much more reliable as it handles USB reconnects
-            if is_bridge:
-                yield ">>> Bridge detected, using flashtool.py for reboot...\n"
-                cmd = [
-                    "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
-                    "-i", interface,
-                    "-u", device_id,
-                    "-r"
-                ]
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT
-                )
-                stdout, _ = await process.communicate()
-                yield stdout.decode()
-                return
-
-            # For regular CAN nodes, we try to send the raw jump command first as it's faster
-            py_cmd = f"""
-import socket, struct, sys
-try:
-    s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-    s.bind(("{interface}",))
-    uuid = bytes.fromhex("{device_id}")
-    msg = bytes([0x16]) + uuid
-    msg = msg + bytes([0] * (8 - len(msg)))
-    frame = struct.pack("<IB3x8s", 0x3f0, 7, msg)
-    s.send(frame)
-    print("Jump command sent")
-except Exception as e:
-    print(f"Error: {{e}}", file=sys.stderr)
-    sys.exit(1)
-"""
+            # Using flashtool.py -r is much more reliable for all CAN nodes
+            cmd = [
+                "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
+                "-i", interface,
+                "-u", device_id,
+                "-r"
+            ]
             process = await asyncio.create_subprocess_exec(
-                "python3", "-c", py_cmd,
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
             )
-            stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                yield stdout.decode()
-            else:
-                yield f"!!! Error sending jump command: {stdout.decode()}\n"
-                # Fallback to flashtool.py
-                yield ">>> Falling back to flashtool.py...\n"
-                cmd = [
-                    "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
-                    "-i", interface,
-                    "-u", device_id,
-                    "-r"
-                ]
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT
-                )
-                stdout, _ = await process.communicate()
-                yield stdout.decode()
+            stdout, _ = await process.communicate()
+            yield stdout.decode()
             return
 
         # Fallback/Serial method
@@ -434,7 +389,14 @@ except Exception as e:
         """'Flashes' the Linux process by installing the binary to /usr/local/bin/klipper_mcu."""
         yield f">>> Installing Linux MCU binary: {firmware_path}...\n"
         try:
-            # 1. Copy to /usr/local/bin/klipper_mcu
+            # 1. Ensure service is stopped and file is not busy
+            await asyncio.create_subprocess_exec("sudo", "systemctl", "stop", "klipper-mcu.service")
+            
+            # Kill any remaining processes using the file
+            await asyncio.create_subprocess_exec("sudo", "fuser", "-k", "/usr/local/bin/klipper_mcu")
+            await asyncio.sleep(2)
+            
+            # 2. Copy to /usr/local/bin/klipper_mcu
             cmd = ["sudo", "cp", firmware_path, "/usr/local/bin/klipper_mcu"]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
