@@ -70,6 +70,14 @@ class FlashManager:
             print(f"Error querying Moonraker: {e}")
         return mcus
 
+    async def trigger_firmware_restart(self):
+        """Sends a FIRMWARE_RESTART command to Klipper via Moonraker."""
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post("http://localhost:7125/printer/gcode/script?script=FIRMWARE_RESTART", timeout=2.0)
+        except Exception as e:
+            print(f"Error sending FIRMWARE_RESTART: {e}")
+
     async def discover_can_devices(self) -> List[Dict[str, str]]:
         """Discovers CAN devices using Klipper's canbus_query.py, Katapult's flashtool.py, and Moonraker API in parallel."""
         seen_uuids = {} # uuid -> device_dict

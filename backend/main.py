@@ -216,10 +216,15 @@ async def batch_operation(action: str):
                             continue
                             
                         status = await flash_mgr.check_device_status(dev['id'], dev['method'])
-                        # Only reboot if it's in service AND marked as a Katapult device
-                        if status == "service" and dev.get('is_katapult'):
+                        # Reboot if it's in service AND (marked as Katapult OR is a CAN device)
+                        if status == "service" and (dev.get('is_katapult') or dev['method'] == 'can'):
                             reboot_tasks.append({"id": dev['id'], "method": dev['method'], "name": dev['name']})
                 
+                if reboot_tasks:
+                    yield ">>> Triggering Firmware Restart to enter bootloader mode...\n"
+                    await flash_mgr.trigger_firmware_restart()
+                    await asyncio.sleep(2) # Give it a moment to process
+
                 # Now stop services to clear the bus
                 yield await manage_klipper_services("stop")
                 await asyncio.sleep(2) # Let the bus settle
