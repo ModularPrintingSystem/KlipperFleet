@@ -10,7 +10,9 @@ fi
 echo "KlipperFleet: Pulling latest changes..."
 cd "$SRCDIR" || exit
 git fetch origin
-git reset --hard origin/main
+# Reset to the current branch instead of hardcoding main
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+git reset --hard "origin/$CURRENT_BRANCH"
 
 echo "KlipperFleet: Running installation script..."
 chmod +x install.sh

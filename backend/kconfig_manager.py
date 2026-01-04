@@ -1,18 +1,17 @@
 import kconfiglib
 import os
-import json
 from typing import List, Dict, Any, Optional
 
 class KconfigManager:
-    def __init__(self, klipper_dir: str):
-        self.klipper_dir = klipper_dir
-        self.kconfig_file = os.path.join(klipper_dir, "src", "Kconfig")
+    def __init__(self, klipper_dir: str) -> None:
+        self.klipper_dir: str = klipper_dir
+        self.kconfig_file: str = os.path.join(klipper_dir, "src", "Kconfig")
         self.kconf = None
 
-    def load_kconfig(self, config_file: Optional[str] = None):
+    def load_kconfig(self, config_file: Optional[str] = None) -> None:
         """Loads the Kconfig file and optionally an existing .config file."""
         # Set environment variables that Klipper's Kconfig expects
-        abs_klipper_dir = os.path.abspath(self.klipper_dir)
+        abs_klipper_dir: str = os.path.abspath(self.klipper_dir)
         os.environ["SRCTREE"] = abs_klipper_dir
         os.environ["srctree"] = abs_klipper_dir
         
@@ -20,7 +19,7 @@ class KconfigManager:
             raise FileNotFoundError(f"Kconfig file not found at {self.kconfig_file}")
 
         # Save current CWD and switch to klipper_dir so relative 'source' paths resolve
-        old_cwd = os.getcwd()
+        old_cwd: str = os.getcwd()
         os.chdir(abs_klipper_dir)
         try:
             # kconfiglib.Kconfig will use the environment variables to resolve 'source' paths
@@ -42,7 +41,7 @@ class KconfigManager:
         items = []
         curr = node.list
         while curr:
-            item = self._serialize_node(curr)
+            item: Dict[str, Any] | None = self._serialize_node(curr)
             if item:
                 # Recursively parse children if it's a menu or has a list
                 if curr.list:
@@ -79,7 +78,7 @@ class KconfigManager:
             }
 
         # Handle Symbols and Choices
-        type_map = {
+        type_map: Dict[int, str] = {
             kconfiglib.BOOL: "bool",
             kconfiglib.TRISTATE: "tristate",
             kconfiglib.STRING: "string",
@@ -90,9 +89,9 @@ class KconfigManager:
         
         # Generate a unique name for anonymous choices using prompt and line number
         if isinstance(sym, kconfiglib.Choice) and not sym.name:
-            name = f"__choice_{node.prompt[0]}_{node.linenr}"
+            name: str = f"__choice_{node.prompt[0]}_{node.linenr}"
         else:
-            name = sym.name if hasattr(sym, 'name') and sym.name else f"__node_{node.prompt[0]}_{node.linenr}"
+            name: str = sym.name if hasattr(sym, 'name') and sym.name else f"__node_{node.prompt[0]}_{node.linenr}"
 
         entry = {
             "name": name,
@@ -127,7 +126,7 @@ class KconfigManager:
             entry["choices"] = visible_choices
 
             # Determine the selected value
-            selected = sym.selection.name if sym.selection else None
+            selected = getattr(sym.selection, 'name', None) if sym.selection else None
             if not selected:
                 for s in sym.syms:
                     if s.str_value == 'y':
@@ -145,7 +144,7 @@ class KconfigManager:
 
         return entry
 
-    def set_value(self, name: str, value: str):
+    def set_value(self, name: str, value: str) -> None:
         """Sets a value for a symbol in the current configuration."""
         if not self.kconf:
             self.load_kconfig()
@@ -187,7 +186,7 @@ class KconfigManager:
             if choice.visibility > 0 and value and value in self.kconf.syms:
                 self.kconf.syms[value].set_value('y')
 
-    def save_config(self, output_path: str):
+    def save_config(self, output_path: str) -> None:
         """Saves the current configuration to a file."""
         if self.kconf:
             self.kconf.write_config(output_path)

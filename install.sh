@@ -67,7 +67,13 @@ chmod +x *.sh
 
 # 3. Install System Dependencies
 echo "KlipperFleet: Installing system dependencies..."
-apt-get update && apt-get install -y python3-venv python3-pip git
+apt-get update && apt-get install -y python3-venv python3-pip git dfu-util
+
+# Setup udev rules for DFU devices
+echo "KlipperFleet: Setting up udev rules for DFU devices..."
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", MODE="0666"' | sudo tee /etc/udev/rules.d/99-stm32-dfu.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 
 # 4. Setup Python Virtual Environment
 echo "KlipperFleet: Setting up Python virtual environment..."

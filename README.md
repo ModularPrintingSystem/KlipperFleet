@@ -1,27 +1,41 @@
 # KlipperFleet
 
 > [!WARNING]
-> **ALPHA SOFTWARE**: KlipperFleet is currently in alpha. It has only been extensively tested on **CAN bus** and **Linux Process** devices.
+> **ALPHA SOFTWARE**: KlipperFleet is currently in alpha. It has only been tested on specific (listed below) **CAN bus**, **STM32 Serial/DFU** devices, as well as **Linux Process**.
 >
-> **Kalico and Fluidd Users**: Be advised these are unsupported at the moment, but both on the roadmap for integration.
-> 
-> **USB and DFU flashing are currently in active development.** While the build system is fully functional, automated USB/DFU flashing is being refined in the `dev` branch and will be available in the next major update. You can still use KlipperFleet to compile your firmware and download the binaries for manual flashing.
+> **Non-Raspberry Pi, Kalico, and Fluidd Users**: Be advised these are unsupported at the moment, but on the roadmap for integration and testing later.
 >
-> Contributions and bug reports are highly appreciated!
+> Contributions and [bug reports](https://github.com/JohnBaumb/KlipperFleet/issues) are highly appreciated!
 
 KlipperFleet is a "one-stop-shop" for managing Klipper firmware across your entire fleet of MCUs on a single printer. It provides a modern web interface (integrated into Mainsail) to configure, build, and flash firmware without ever touching the command line.
 
 ## Features
 
 - **Dynamic Web Configurator**: Replaces `make menuconfig` with a reactive web form that parses Klipper's source code in real-time.
-- **Fleet Management**: Register all your MCUs (Serial or CAN), assign them profiles, and manage them from a single dashboard.
+- **Fleet Management**: Register all your MCUs (Serial, CAN, or DFU), assign them profiles, and manage them from a single dashboard. DFU IDs can be "attached" to Serial devices, allowing KlipperFleet to track the MCU across reboots and automatically identify it when it enters the bootloader.
 - **Smart Sequencing**: Automatically handles CAN bridge hosts by flashing downstream nodes first, then the bridge host last.
-- **UART Support**: Detects and manages MCUs connected via Raspberry Pi UART (GPIO) (You know katapult supports UART and USB devices now, right?)
+- **UART Support**: Detects and manages MCUs connected via Raspberry Pi UART (GPIO).
 - **One-Click Batch Operations**: Build firmware for your entire fleet, flash all ready devices, or perform a full "Build & Flash All" with a single click.
-- **Automatic Katapult Reboot**: Intelligent detection of Klipper vs. Katapult modes. If a device is in service, KlipperFleet can automatically reboot it into Katapult mode for flashing.
-- **Service Management**: Automatically stops and starts Klipper/Moonraker services during flashing to ensure exclusive access to the CAN bus, preventing "Request Block" errors.
-- **Integrated Flashing**: Flash firmware via Serial or CAN (Katapult) directly from the browser with real-time log streaming.
+- **Automatic Katapult/DFU Reboot**: Intelligent detection of Klipper vs. Katapult/DFU modes. If a device is in service, KlipperFleet can automatically reboot it into the appropriate bootloader for flashing.
+- **Service Management**: Automatically stops and starts Klipper/Moonraker services during flashing to ensure exclusive access to the bus.
+- **Integrated Flashing**: Flash firmware via Serial, CAN (Katapult), or DFU directly from the browser with real-time log streaming.
 - **Mainsail Integration**: Designed to look and feel like a native part of the Mainsail ecosystem.
+
+## Compatibility & Tested Hardware
+
+> [!IMPORTANT]
+> **KlipperFleet is in Alpha.** While the core logic is robust, hardware-specific quirks exist. The following configurations have been verified. **All other hardware should be considered UNTESTED, and if you run into issues, please open an issue in github so it can be resolved.**
+
+### Tested Hardware
+- **Host MCUs**: Raspberry Pi (Linux Process)
+- **CAN Nodes**: Spider 3 H7, BTT MMBCAN v1
+- **DFU/USB**: Spider 3 (F446) - *Tested with 32KiB bootloader*
+- **Bridges**: Spider 3 H7 (H723) Katapult CAN Bridge mode
+
+### Tested Interfaces
+- **CANbus**: 1Mbit (Katapult & Klipper)
+- **USB**: DFU (Standard STM32 Bootloader)
+- **Serial**: 1200bps "Magic Baud" DFU entry
 
 ## Screenshots
 
@@ -31,8 +45,11 @@ KlipperFleet is a "one-stop-shop" for managing Klipper firmware across your enti
 ### Configurator
 ![Configurator](https://raw.githubusercontent.com/JohnBaumb/KlipperFleet/main/images/configurator.png)
 
-### Fleet Manager
+### Fleet Manager (CAN & DFU Support)
 ![Fleet Manager](https://raw.githubusercontent.com/JohnBaumb/KlipperFleet/main/images/fleet_manager.png)
+
+### DFU Device Discovery
+![DFU Discovery](https://raw.githubusercontent.com/JohnBaumb/KlipperFleet/main/images/ender3_fleet_dfu.png)
 
 ## Prerequisites
 
@@ -104,6 +121,7 @@ If the entry does not appear, you can manually add it to `.theme/navi.json`:
 
 1. **Configurator**: Go to the Configurator tab, select a profile name, and configure your MCU settings. Click **Save**.
 2. **Fleet Manager**: Go to the Fleet Manager tab and click the **Scan** icon. Add your discovered devices to the fleet and assign them the profiles you created.
+   - **Tip**: Use the **Attach** () button to link a discovered DFU ID to an existing Serial device. This allows KlipperFleet to track the device across reboots and automatically identify it when it enters the bootloader for flashing.
 3. **Dashboard**: 
    - **Build All**: Compiles firmware for every profile assigned to a device in your fleet.
    - **Flash Ready**: Flashes all devices currently in Katapult mode.

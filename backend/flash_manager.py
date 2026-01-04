@@ -1,51 +1,68 @@
-import subprocess
 import os
 import asyncio
 import glob
 import httpx
-from typing import List, Dict, Any, AsyncGenerator
+from typing import List, Dict, AsyncGenerator, Optional
+from asyncio.subprocess import Process
 
 class FlashManager:
-    def __init__(self, klipper_dir: str, katapult_dir: str):
-        self.klipper_dir = klipper_dir
-        self.katapult_dir = katapult_dir
+    def __init__(self, klipper_dir: str, katapult_dir: str) -> None:
+        self.klipper_dir: str = klipper_dir
+        self.katapult_dir: str = katapult_dir
+
+        # DFU operations can get flaky if multiple dfu-util processes run concurrently
+        # (e.g. UI polling dfu-util -l while a flash is in progress).
+        self._dfu_lock: asyncio.Lock = asyncio.Lock()
+        self._dfu_cache: List[Dict[str, str]] = []
+        self._dfu_cache_time: float = 0.0
+        self._dfu_cache_ttl_s: float = 1.0
 
     async def discover_serial_devices(self, skip_moonraker: bool = False) -> List[Dict[str, str]]:
         """Lists all serial devices in /dev/serial/by-id/ and common UART ports."""
         devices = []
         
         # 1. USB Serial devices (by-id is preferred for stability)
-        usb_devs = glob.glob("/dev/serial/by-id/*")
+        usb_devs: List[str] = glob.glob("/dev/serial/by-id/*")
         
         # 2. Common UART and CDC-ACM devices
         # We include /dev/ttyACM* and /dev/ttyUSB* because some devices (especially in Katapult)
         # might not immediately get a by-id link or might be generic.
-        candidates = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + ["/dev/ttyAMA0", "/dev/ttyS0"]
+        candidates: List[str] = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + ["/dev/ttyAMA0", "/dev/ttyS0"]
         
         moonraker_mcus = {}
         if not skip_moonraker:
-            moonraker_mcus = await self._get_moonraker_mcus()
+            moonraker_mcus: Dict[str, Dict[str, str]] = await self._get_moonraker_mcus()
         
         # Combine and deduplicate
         # We use absolute paths for everything
-        all_devs = list(set(usb_devs + [os.path.abspath(d) for d in candidates if os.path.exists(d)]))
+        all_devs: List[str] = list(set(usb_devs + [os.path.abspath(d) for d in candidates if os.path.exists(d)]))
         
         for dev in all_devs:
-            name = os.path.basename(dev)
-            is_configured = dev in moonraker_mcus
+            name: str = os.path.basename(dev)
+            is_configured: bool = dev in moonraker_mcus
             
             # If it's a by-id device, it's almost certainly an MCU
             if dev.startswith("/dev/serial/by-id/"):
+                # If it has "klipper" in the name, it's in firmware mode (service)
+                # If it has "katapult" or "canboot", it's in bootloader mode (ready)
+                mode = "ready"
+                if "klipper" in dev.lower():
+                    mode = "service"
+                elif "katapult" in dev.lower() or "canboot" in dev.lower():
+                    mode = "ready"
+                elif is_configured:
+                    mode = "service"
+                
                 if is_configured:
-                    name = f"{moonraker_mcus[dev]} ({name})"
-                devices.append({"id": dev, "name": name, "type": "usb"})
+                    name: str = f"{moonraker_mcus[dev]['name']} ({name})"
+                devices.append({"id": dev, "name": name, "type": "usb", "mode": mode})
             
             # If it's a ttyACM/ttyUSB device, we show it if it's NOT already represented by a by-id link
             # or if it's configured in Klipper.
             elif dev.startswith("/dev/ttyACM") or dev.startswith("/dev/ttyUSB"):
                 # Check if this physical device is already in devices via by-id
                 # (This is a bit tricky, but usually by-id is a symlink to ttyACM/USB)
-                real_path = os.path.realpath(dev)
+                real_path: str = os.path.realpath(dev)
                 already_added = False
                 for d in devices:
                     if os.path.realpath(d['id']) == real_path:
@@ -53,43 +70,172 @@ class FlashManager:
                         break
                 
                 if not already_added:
+                    # For generic tty devices, we rely on is_configured or name hints
+                    mode = "ready"
+                    if "klipper" in dev.lower():
+                        mode = "service"
+                    elif "katapult" in dev.lower() or "canboot" in dev.lower():
+                        mode = "ready"
+                    elif is_configured:
+                        mode = "service"
+                    
                     if is_configured:
-                        name = f"{moonraker_mcus[dev]} ({name})"
-                    devices.append({"id": dev, "name": name, "type": "usb"})
+                        name: str = f"{moonraker_mcus[dev]['name']} ({name})"
+                    devices.append({"id": dev, "name": name, "type": "usb", "mode": mode})
 
             # If it's a raw UART device, only show it if it's actually configured in Klipper
             elif is_configured:
-                name = f"{moonraker_mcus[dev]} ({name})"
-                devices.append({"id": dev, "name": name, "type": "uart"})
+                name: str = f"{moonraker_mcus[dev]['name']} ({name})"
+                devices.append({"id": dev, "name": name, "type": "uart", "mode": "service"})
                 
         return devices
 
-    async def _get_moonraker_mcus(self) -> Dict[str, str]:
-        """Queries Moonraker for configured MCUs (CAN UUIDs and Serial paths)."""
+    async def discover_dfu_devices(self) -> List[Dict[str, str]]:
+        """Lists all devices in DFU mode using dfu-util -l."""
+        async with self._dfu_lock:
+            now: float = asyncio.get_event_loop().time()
+            if (now - self._dfu_cache_time) < self._dfu_cache_ttl_s:
+                return list(self._dfu_cache)
+
+            devices: List[Dict[str, str]] = []
+            try:
+                process: Process = await asyncio.create_subprocess_exec(
+                    "sudo", "dfu-util", "-l",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await process.communicate()
+                lines: List[str] = stdout.decode().splitlines()
+
+                # Example line: Found DFU: [0483:df11] ver=0200, devnum=12, cfg=1, intf=0, path="1-1.2", alt=0, name="@Internal Flash  /0x08000000/064*0002Kg", serial="357236543131"
+                for line in lines:
+                    if "Found DFU:" in line:
+                        # Extract VID:PID
+                        vid_pid: str = ""
+                        if "[" in line and "]" in line:
+                            vid_pid = line.split("[")[1].split("]")[0]
+
+                        # Extract serial
+                        serial: str = ""
+                        if 'serial="' in line:
+                            serial = line.split('serial="')[1].split('"')[0]
+
+                        # Extract path
+                        path: str = ""
+                        if 'path="' in line:
+                            path = line.split('path="')[1].split('"')[0]
+
+                        name: str = f"DFU Device ({vid_pid})"
+                        if serial:
+                            name += f" S/N: {serial}"
+
+                        # We use the serial or path as the ID for disambiguation.
+                        # If serial is "UNKNOWN" or empty, we MUST use the path.
+                        dev_id: str = serial if (serial and serial != "UNKNOWN") else path
+
+                        # Deduplicate: dfu-util -l lists multiple alt settings for the same device
+                        if any(d['id'] == dev_id for d in devices):
+                            continue
+
+                        devices.append({
+                            "id": dev_id,
+                            "name": name,
+                            "type": "dfu",
+                            "vid_pid": vid_pid,
+                            "path": path,
+                            "serial": serial,
+                            "mode": "ready"
+                        })
+            except Exception as e:
+                print(f"Error discovering DFU devices: {e}")
+
+            self._dfu_cache = list(devices)
+            self._dfu_cache_time = now
+            return list(devices)
+
+    async def _get_moonraker_mcus(self) -> Dict[str, Dict[str, str]]:
+        """Queries Moonraker for configured MCUs and their current status."""
         mcus = {}
         try:
             async with httpx.AsyncClient() as client:
-                # Query configfile to get all configured MCUs
-                response = await client.get("http://localhost:7125/printer/objects/query?configfile", timeout=2.0)
+                # 1. Query configfile to get all configured MCUs
+                response: httpx.Response = await client.get("http://127.0.0.1:7125/printer/objects/query?configfile", timeout=2.0)
+                config = {}
                 if response.status_code == 200:
                     data = response.json()
                     config = data.get("result", {}).get("status", {}).get("configfile", {}).get("config", {})
-                    for section_name, section_data in config.items():
-                        if not isinstance(section_data, dict):
-                            continue
+                
+                # 2. Query all mcu and canbus_stats objects
+                # We first need to know which ones exist
+                list_response: httpx.Response = await client.get("http://127.0.0.1:7125/printer/objects/list", timeout=2.0)
+                can_stats = {}
+                mcu_statuses = {}
+                if list_response.status_code == 200:
+                    all_objects = list_response.json().get("result", {}).get("objects", [])
+                    stat_objects = [obj for obj in all_objects if obj.startswith("canbus_stats")]
+                    mcu_objects = [obj for obj in all_objects if obj.startswith("mcu")]
+                    
+                    query_objects = stat_objects + mcu_objects
+                    if query_objects:
+                        query_url = f"http://127.0.0.1:7125/printer/objects/query?{'&'.join(query_objects)}"
+                        stats_response: httpx.Response = await client.get(query_url, timeout=2.0)
+                        if stats_response.status_code == 200:
+                            raw_data = stats_response.json().get("result", {}).get("status", {})
+                            for obj_name, obj_data in raw_data.items():
+                                if obj_name.startswith("canbus_stats"):
+                                    section = obj_name.replace("canbus_stats ", "").strip()
+                                    can_stats[section] = obj_data
+                                elif obj_name.startswith("mcu"):
+                                    section = obj_name # e.g. "mcu" or "mcu toolhead"
+                                    mcu_statuses[section] = obj_data
+
+                for section_name, section_data in config.items():
+                    if not isinstance(section_data, dict):
+                        continue
+                    
+                    identifier = None
+                    if "canbus_uuid" in section_data:
+                        identifier = section_data["canbus_uuid"].lower().strip()
+                    elif "serial" in section_data:
+                        identifier = section_data["serial"].strip()
+                    
+                    if identifier:
+                        # Check if this MCU is active
+                        is_active = False
+                        stats = {}
                         
-                        if "canbus_uuid" in section_data:
-                            uuid = section_data["canbus_uuid"].lower().strip()
-                            mcus[uuid] = section_name
+                        # 1. Check canbus_stats (for CAN nodes)
+                        stats_key = section_name
+                        if section_name.startswith("mcu "):
+                            stats_key = section_name[4:].strip()
                         
-                        if "serial" in section_data:
-                            serial_path = section_data["serial"].strip()
-                            mcus[serial_path] = section_name
+                        if stats_key in can_stats:
+                            stats = can_stats[stats_key]
+                            if stats.get('bus_state') == "Connected":
+                                is_active = True
+                        elif identifier in can_stats:
+                            stats = can_stats[identifier]
+                            if stats.get('bus_state') == "Connected":
+                                is_active = True
+                        
+                        # 2. Check mcu status (for serial/all nodes)
+                        # If it has an mcu_version, it's connected and active
+                        if not is_active:
+                            mcu_key = section_name
+                            if mcu_key in mcu_statuses:
+                                if mcu_statuses[mcu_key].get('mcu_version'):
+                                    is_active = True
+                        
+                        mcus[identifier] = {
+                            "name": section_name,
+                            "active": is_active,
+                            "stats": stats
+                        }
         except Exception as e:
             print(f"Error querying Moonraker: {e}")
         return mcus
 
-    async def trigger_firmware_restart(self):
+    async def trigger_firmware_restart(self) -> None:
         """Sends a FIRMWARE_RESTART command to Klipper via Moonraker."""
         try:
             async with httpx.AsyncClient() as client:
@@ -97,11 +243,11 @@ class FlashManager:
         except Exception as e:
             print(f"Error sending FIRMWARE_RESTART: {e}")
 
-    async def ensure_canbus_up(self, interface: str = "can0", bitrate: int = 1000000):
+    async def ensure_canbus_up(self, interface: str = "can0", bitrate: int = 1000000) -> None:
         """Ensures the CAN interface is up."""
         try:
             # Check if up
-            process = await asyncio.create_subprocess_exec(
+            process: Process = await asyncio.create_subprocess_exec(
                 "ip", "link", "show", interface,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
@@ -116,18 +262,18 @@ class FlashManager:
         except Exception as e:
             print(f"Error ensuring CAN up: {e}")
 
-    async def discover_can_devices(self) -> List[Dict[str, str]]:
+    async def discover_can_devices(self, skip_moonraker: bool = False) -> List[Dict[str, str]]:
         """Discovers CAN devices using Klipper's canbus_query.py, Katapult's flashtool.py, and Moonraker API in parallel."""
         await self.ensure_canbus_up()
         seen_uuids = {} # uuid -> device_dict
 
         async def run_klipper_query():
             try:
-                klipper_python = os.path.abspath(os.path.join(self.klipper_dir, "..", "klippy-env", "bin", "python3"))
+                klipper_python: str = os.path.abspath(os.path.join(self.klipper_dir, "..", "klippy-env", "bin", "python3"))
                 if not os.path.exists(klipper_python):
                     klipper_python = "python3"
                 
-                process = await asyncio.create_subprocess_exec(
+                process: Process = await asyncio.create_subprocess_exec(
                     klipper_python, os.path.join(self.klipper_dir, "scripts", "canbus_query.py"), "can0",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
@@ -136,10 +282,10 @@ class FlashManager:
                 results = []
                 for line in stdout.decode().splitlines():
                     if "canbus_uuid=" in line:
-                        uuid = line.split("canbus_uuid=")[1].split(",")[0].strip()
+                        uuid: str = line.split("canbus_uuid=")[1].split(",")[0].strip()
                         app = "Unknown"
                         if "Application:" in line:
-                            app = line.split("Application:")[1].strip()
+                            app: str = line.split("Application:")[1].strip()
                         results.append((uuid, app))
                 return results
             except Exception:
@@ -147,21 +293,21 @@ class FlashManager:
 
         async def run_katapult_query():
             try:
-                process = await asyncio.create_subprocess_exec(
+                process: Process = await asyncio.create_subprocess_exec(
                     "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"), "-i", "can0", "-q",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5.0)
                 results = []
-                output = stdout.decode()
+                output: str = stdout.decode()
                 for line in output.splitlines():
                     if "UUID:" in line or "Detected UUID:" in line:
-                        parts = line.replace("Detected UUID:", "UUID:").split(",")
-                        uuid = parts[0].split("UUID:")[1].strip()
+                        parts: List[str] = line.replace("Detected UUID:", "UUID:").split(",")
+                        uuid: str = parts[0].split("UUID:")[1].strip()
                         app = "Unknown"
                         if len(parts) > 1 and "Application:" in parts[1]:
-                            app = parts[1].split("Application:")[1].strip()
+                            app: str = parts[1].split("Application:")[1].strip()
                         results.append((uuid, app))
                 return results
             except Exception as e:
@@ -171,13 +317,16 @@ class FlashManager:
         # Run discovery methods sequentially to avoid CAN bus contention
         katapult_res = await run_katapult_query()
         klipper_res = await run_klipper_query()
-        moonraker_res = await self._get_moonraker_mcus()
+        
+        moonraker_res = {}
+        if not skip_moonraker:
+            moonraker_res: Dict[str, Dict[str, str]] = await self._get_moonraker_mcus()
 
         # Merge results (Priority: Katapult > Klipper > Moonraker)
         # 1. Katapult results (most accurate for bootloader status)
         for uuid, app in katapult_res:
             # If application is Klipper, it's in service. If Katapult/CanBoot, it's ready.
-            mode = "ready" if app.lower() in ["katapult", "canboot"] else "service"
+            mode: str = "ready" if app.lower() in ["katapult", "canboot"] else "service"
             seen_uuids[uuid] = {
                 "id": uuid, 
                 "name": f"CAN Device ({uuid})", 
@@ -195,21 +344,29 @@ class FlashManager:
                     "mode": "service"
                 }
 
-        # 3. Moonraker results (fallback for active nodes and name enrichment)
+        # 3. Moonraker results (name enrichment and fallback)
         if isinstance(moonraker_res, dict):
-            for identifier, section_name in moonraker_res.items():
-                # If it's in seen_uuids, it's a CAN device we found via query
-                if identifier in seen_uuids:
-                    if "CAN Device" in seen_uuids[identifier]["name"]:
-                        seen_uuids[identifier]["name"] = section_name
-                # If it's not in seen_uuids but looks like a UUID, add it as a Klipper device
-                elif len(identifier) == 12 and all(c in '0123456789abcdef' for c in identifier):
-                    seen_uuids[identifier] = {
-                        "id": identifier, 
-                        "name": section_name, 
-                        "application": "Klipper",
-                        "mode": "service"
-                    }
+            for identifier, info in moonraker_res.items():
+                # Check if identifier looks like a UUID (12 hex chars)
+                if len(identifier) == 12 and all(c in '0123456789abcdef' for c in identifier):
+                    section_name = info["name"]
+                    if identifier in seen_uuids:
+                        if "CAN Device" in seen_uuids[identifier]["name"]:
+                            seen_uuids[identifier]["name"] = section_name
+                    else:
+                        # Fallback: Add it as 'service' if Moonraker knows about it
+                        # But only if it's actually active, otherwise mark as offline
+                        mode = "service" if info.get("active") else "offline"
+                        seen_uuids[identifier] = {
+                            "id": identifier,
+                            "name": section_name,
+                            "application": "Klipper (Configured)" if info.get("active") else "Klipper (Offline)",
+                            "mode": mode
+                        }
+                    
+                    # Add stats if available
+                    if info.get("stats"):
+                        seen_uuids[identifier]["stats"] = info["stats"]
 
         return list(seen_uuids.values())
 
@@ -223,46 +380,234 @@ class FlashManager:
         }]
 
     async def is_interface_up(self, interface: str = "can0") -> bool:
-        """Checks if a network interface is UP."""
+        """Checks if a network interface is UP and has a carrier."""
         try:
-            process = await asyncio.create_subprocess_exec(
+            process: Process = await asyncio.create_subprocess_exec(
                 "ip", "link", "show", interface,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, _ = await process.communicate()
-            return b"state UP" in stdout or b"state UNKNOWN" in stdout # UNKNOWN can happen for some virtual/bridge interfaces
+            output = stdout.decode()
+            # Interface must be UP and NOT have NO-CARRIER
+            is_up = "state UP" in output or "state UNKNOWN" in output
+            has_carrier = "NO-CARRIER" not in output
+            return is_up and has_carrier
         except Exception:
             return False
 
-    async def check_device_status(self, device_id: str, method: str) -> str:
+    def _extract_serial_from_id(self, device_id: str) -> Optional[str]:
+        """Helper to extract a potential serial number from a device ID or path."""
+        if not device_id:
+            return None
+            
+        # 1. If it's a path, extract from filename
+        if device_id.startswith("/dev/serial/by-id/"):
+            filename = os.path.basename(device_id)
+            # Heuristic: the serial is usually the longest part between underscores or before -if
+            parts = filename.replace("-if", "_").split("_")
+            # Filter out common prefixes/suffixes
+            candidates = [p for p in parts if p not in ["usb", "Klipper", "katapult", "CanBoot", "00"]]
+            if candidates:
+                # Sort by length, longest is likely the serial
+                return sorted(candidates, key=len, reverse=True)[0]
+        
+        # 2. If it's not a path and looks like a serial number (long enough, no slashes)
+        if not "/" in device_id and len(device_id) > 5:
+            return device_id
+            
+        return None
+
+    async def resolve_dfu_id(self, device_id: str, known_dfu_id: Optional[str] = None) -> str:
+        """Attempts to find a DFU device ID that matches a Serial ID (via serial number)."""
+        devs: List[Dict[str, str]] = await self.discover_dfu_devices()
+        
+        if not devs:
+            return device_id
+
+        # 1. If we have a known DFU ID, try to find it exactly
+        if known_dfu_id:
+            for d in devs:
+                if d['id'] == known_dfu_id:
+                    return d['id']
+            
+            # 2. If known_dfu_id is a generic name (like STM32FxSTM32), 
+            # and there's only one DFU device, assume it's the one.
+            if len(devs) == 1:
+                return devs[0]['id']
+
+        # 3. Try to match by serial number
+        target_serial = self._extract_serial_from_id(device_id)
+        for d in devs:
+            if d['id'] == device_id:
+                return d['id']
+            # Check if the DFU serial matches
+            if d.get('serial') and target_serial and d['serial'] == target_serial:
+                return d['id']
+        
+        # 4. Fallback: If there is only ONE DFU device connected, assume it is the target.
+        # This handles cases where the DFU serial is generic (e.g. "STM32FxSTM32") or
+        # does not match the Klipper serial number.
+        if len(devs) == 1:
+            return devs[0]['id']
+
+        return device_id
+
+    async def resolve_serial_id(self, device_id: str, known_serial_id: Optional[str] = None) -> str:
+        """Attempts to find a Serial ID that matches a DFU ID or a Klipper ID (via serial number)."""
+        if known_serial_id and os.path.exists(known_serial_id):
+            return known_serial_id
+
+        # If it's already a serial device that exists, return it
+        if os.path.exists(device_id):
+            return device_id
+            
+        serials: List[Dict[str, str]] = await self.discover_serial_devices(skip_moonraker=True)
+        
+        # 1. Try to extract a serial number
+        target_serial = self._extract_serial_from_id(device_id)
+            
+        # 2. If we still don't have it, try looking it up as a DFU device
+        if not target_serial:
+            dfus: List[Dict[str, str]] = await self.discover_dfu_devices()
+            for d in dfus:
+                if d['id'] == device_id:
+                    target_serial = d.get('serial')
+                    break
+        
+        if target_serial:
+            for s in serials:
+                # Match if the target serial is in the new ID
+                if target_serial in s['id']:
+                    return s['id']
+        
+        return device_id
+
+    async def check_device_status(self, device_id: str, method: str, dfu_id: Optional[str] = None, skip_moonraker: bool = False, is_bridge: bool = False, interface: str = "can0") -> str:
         """Checks if a device is reachable and its current mode."""
         method = method.lower()
+        
+        # Special handling for bridges
+        if is_bridge:
+            # 1. Check if it's in Katapult mode (Serial)
+            serials = await self.discover_serial_devices(skip_moonraker=True)
+            target_serial = self._extract_serial_from_id(device_id)
+            for s in serials:
+                # Match by ID exactly
+                if s['id'] == device_id:
+                    return "ready"
+                # Or match by serial number if we have one
+                if target_serial and target_serial in s['id']:
+                    return "ready"
+            
+            # 2. Check if it's in DFU mode
+            # Only if we have a reason to look for DFU (e.g. dfu_id provided)
+            if dfu_id:
+                dfus = await self.discover_dfu_devices()
+                resolved_dfu_id = await self.resolve_dfu_id(device_id, known_dfu_id=dfu_id)
+                if any(d['id'] == resolved_dfu_id for d in dfus):
+                    return "ready"
+
+            # 3. Check if the interface is up (In Service)
+            # But only if the hardware is actually present
+            if method == "serial" or device_id.startswith("/dev/"):
+                # For serial bridges, the serial device MUST exist
+                if os.path.exists(device_id) and await self.is_interface_up(interface):
+                    return "service"
+            else:
+                # For CAN-based bridges (identified by UUID), we check Moonraker
+                # or if the interface is up (if Moonraker is skipped)
+                if await self.is_interface_up(interface):
+                    if not skip_moonraker:
+                        mcus = await self._get_moonraker_mcus()
+                        if device_id in mcus and mcus[device_id]['active']:
+                            return "service"
+                        # If Moonraker says it's NOT active, then it's not in service
+                        # even if the interface is up (might be another device)
+                        return "offline"
+                    
+                    # If skipping moonraker, we can't be 100% sure, but if the interface is up
+                    # and it's a bridge, it's likely "in service" (providing the bus)
+                    return "service"
+            
+            return "offline"
+
         if method == "serial":
-            return "ready" if os.path.exists(device_id) else "offline"
+            if os.path.exists(device_id):
+                # Check if it's Klipper or Katapult
+                if "katapult" in device_id.lower() or "canboot" in device_id.lower():
+                    return "ready"
+                return "service" # Assume Klipper if it exists and isn't katapult
+            
+            # 1. Check if it's currently in DFU mode
+            resolved_dfu_id: str = await self.resolve_dfu_id(device_id, known_dfu_id=dfu_id)
+            if resolved_dfu_id != device_id:
+                return "dfu"
+
+            # 2. If the path doesn't exist, it might have changed ID (e.g. Klipper -> Katapult)
+            resolved_id: str = await self.resolve_serial_id(device_id)
+            if resolved_id != device_id and os.path.exists(resolved_id):
+                if "katapult" in resolved_id.lower() or "canboot" in resolved_id.lower():
+                    return "ready"
+                return "service"
+
+            return "offline"
         elif method == "can":
-            devs = await self.discover_can_devices()
+            devs: List[Dict[str, str]] = await self.discover_can_devices(skip_moonraker=skip_moonraker)
             for d in devs:
                 if d['id'] == device_id:
                     return d.get('mode', 'offline')
             
+            # Check if it's currently in DFU mode (if it has a dfu_id)
+            if dfu_id:
+                resolved_dfu_id: str = await self.resolve_dfu_id(device_id, known_dfu_id=dfu_id)
+                if resolved_dfu_id != device_id:
+                    return "dfu"
+
+            return "offline"
+        elif method == "dfu":
+            # 1. Check if it's actually in DFU mode
+            resolved_dfu_id: str = await self.resolve_dfu_id(device_id, known_dfu_id=dfu_id)
+            devs: List[Dict[str, str]] = await self.discover_dfu_devices()
+            if any(d['id'] == resolved_dfu_id for d in devs):
+                return "dfu"
+            
+            # 2. Check if it's in Serial mode (In Service)
+            serial_id: str = await self.resolve_serial_id(device_id)
+            if os.path.exists(serial_id):
+                return "service"
+                
             return "offline"
         elif method == "linux":
             return "ready" if os.path.exists("/tmp/klipper_host_mcu") else "offline"
         return "unknown"
 
     async def reboot_device(self, device_id: str, mode: str = "katapult", method: str = "can", interface: str = "can0", is_bridge: bool = False) -> AsyncGenerator[str, None]:
-        """Reboots a device, either to Katapult or a regular reboot."""
+        """Reboots a device, either to Katapult, DFU, or a regular reboot."""
         if mode == "katapult":
             async for line in self.reboot_to_katapult(device_id, method=method, interface=interface, is_bridge=is_bridge):
                 yield line
+        elif mode == "dfu":
+            async for line in self.reboot_to_dfu(device_id):
+                yield line
         else:
+            # Regular reboot (Return to Service)
+            
+            # If it's a serial device, check if it's actually in DFU mode right now
+            if method == "serial":
+                dfus = await self.discover_dfu_devices()
+                resolved_dfu_id = await self.resolve_dfu_id(device_id)
+                if any(d['id'] == resolved_dfu_id for d in dfus):
+                    method = "dfu"
+                    device_id = resolved_dfu_id
+                    yield f">>> Detected {device_id} in DFU mode. Using DFU reboot.\n"
+
             if method == "can":
                 yield f">>> Requesting regular reboot for {device_id}...\n"
                 # Regular reboot (Return to Service)
                 # We send a Katapult 'COMPLETE' command to jump to the application.
                 # This requires assigning a temporary node ID first.
-                py_cmd = f"""
+                py_cmd: str = f"""
 import socket
 import struct
 import time
@@ -301,7 +646,7 @@ pkt = bytes([0x01, 0x88]) + cmd_body + struct.pack("<H", crc) + bytes([0x99, 0x0
 send_can(0x200, pkt)
 print("Jump command sent to UUID {device_id}")
 """
-                process = await asyncio.create_subprocess_exec(
+                process: Process = await asyncio.create_subprocess_exec(
                     "python3", "-c", py_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT
@@ -309,6 +654,34 @@ print("Jump command sent to UUID {device_id}")
                 stdout, _ = await process.communicate()
                 yield stdout.decode()
                 yield ">>> Regular reboot command sent.\n"
+            elif method == "dfu":
+                yield f">>> Requesting reboot for DFU device {device_id}...\n"
+                # For STM32 DFU, the most reliable way to "leave" DFU mode without flashing
+                # is to perform a dummy upload with the ':leave' flag.
+                # We use 0x08000000 as the default start address for STM32.
+                cmd: List[str] = ["dfu-util", "-d", "0483:df11", "-a", "0", "-s", "0x08000000:leave", "-U", "/tmp/reboot_dummy", "-Z", "1"]
+                
+                # Try to disambiguate if possible
+                if ":" not in device_id and "/" in device_id: # Path
+                    cmd.extend(["-p", device_id])
+                elif ":" not in device_id: # Serial
+                    cmd.extend(["-S", device_id])
+
+                # Ensure the dummy file doesn't block the upload
+                if os.path.exists("/tmp/reboot_dummy"):
+                    os.remove("/tmp/reboot_dummy")
+
+                process: Process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+                stdout, _ = await process.communicate()
+                yield stdout.decode()
+                if process.returncode == 0:
+                    yield ">>> Leave request sent. Device should reboot into firmware shortly.\n"
+                else:
+                    yield ">>> Reboot command failed. The bootloader may not support software reset via DFU.\n"
             else:
                 # For serial, we can try sending the reboot command via flashtool
                 # but usually serial devices jump to app after flash or timeout.
@@ -320,13 +693,13 @@ print("Jump command sent to UUID {device_id}")
         method = method.lower()
         if method == "can":
             # Using flashtool.py -r is much more reliable for all CAN nodes
-            cmd = [
+            cmd: List[str] = [
                 "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
                 "-i", interface,
                 "-u", device_id,
                 "-r"
             ]
-            process = await asyncio.create_subprocess_exec(
+            process: Process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
@@ -335,37 +708,72 @@ print("Jump command sent to UUID {device_id}")
             yield stdout.decode()
             return
 
-        # Fallback/Serial method
-        cmd = [
-            "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
-            "-d", device_id,
-            "-r"
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
-        
-        while True:
-            if process.stdout is None:
-                break
-            line = await process.stdout.readline()
-            if not line:
-                break
-            yield line.decode()
+        # Serial method
+        # 1. Try the 1200bps trick first (common for Katapult/CanBoot on Serial)
+        yield f">>> Attempting 1200bps magic baud on {device_id}...\n"
+        try:
+            import serial
+            ser = serial.Serial(device_id, 1200)
+            ser.close()
+            await asyncio.sleep(2) # Give it time to reboot
+            
+            # If the device path is gone, the trick worked and the device is rebooting
+            if not os.path.exists(device_id):
+                yield ">>> Device disconnected (1200bps trick successful). Waiting for bootloader...\n"
+                return
+        except Exception as e:
+            yield f">>> 1200bps trick skipped or failed: {str(e)}\n"
 
-        await process.wait()
-        if process.returncode == 0:
-            yield ">>> Reboot command sent. Device should appear in Katapult mode shortly.\n"
+        # 2. Also try flashtool.py -r as a backup if the device still exists
+        if os.path.exists(device_id):
+            cmd: List[str] = [
+                "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
+                "-d", device_id,
+                "-r"
+            ]
+            
+            process: Process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT
+            )
+            
+            while True:
+                if process.stdout is None:
+                    break
+                line: bytes = await process.stdout.readline()
+                if not line:
+                    break
+                yield line.decode()
+
+            await process.wait()
+            if process.returncode == 0:
+                yield ">>> Reboot command sent. Device should appear in Katapult mode shortly.\n"
+            else:
+                yield f">>> Reboot command failed with return code {process.returncode}. Device might already be in Katapult or unreachable.\n"
         else:
-            yield f">>> Reboot command failed with return code {process.returncode}. Device might already be in Katapult or unreachable.\n"
+            yield ">>> Device path not found. It may already be in bootloader mode.\n"
+
+    async def reboot_to_dfu(self, device_id: str) -> AsyncGenerator[str, None]:
+        """Attempts to reboot a device into DFU mode using the 1200bps magic baud rate."""
+        # If device_id is a DFU ID, but the device is in Serial mode, resolve it first
+        actual_id: str = await self.resolve_serial_id(device_id)
+        yield f">>> Attempting to reboot {actual_id} into DFU mode (1200bps trick)...\n"
+        try:
+            # The 1200bps trick: open and close the port at 1200bps
+            import serial
+            ser = serial.Serial(actual_id, 1200)
+            ser.close()
+            yield ">>> 1200bps magic baud sent. Waiting 3s for USB enumeration...\n"
+            await asyncio.sleep(3)
+        except Exception as e:
+            yield f">>> Error sending 1200bps magic baud: {str(e)}\n"
+            yield ">>> Please manually enter DFU mode (BOOT0 + RESET) if the device does not appear.\n"
 
     async def flash_serial(self, device_id: str, firmware_path: str) -> AsyncGenerator[str, None]:
         """Flashes a device via Serial using Katapult."""
         yield f">>> Flashing {firmware_path} to {device_id} via Serial...\n"
-        cmd = [
+        cmd: List[str] = [
             "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
             "-f", firmware_path,
             "-d", device_id
@@ -376,7 +784,7 @@ print("Jump command sent to UUID {device_id}")
     async def flash_can(self, uuid: str, firmware_path: str, interface: str = "can0") -> AsyncGenerator[str, None]:
         """Flashes a device via CAN using Katapult."""
         yield f">>> Flashing {firmware_path} to {uuid} via {interface}...\n"
-        cmd = [
+        cmd: List[str] = [
             "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
             "-i", interface,
             "-u", uuid,
@@ -384,6 +792,82 @@ print("Jump command sent to UUID {device_id}")
         ]
         async for line in self._run_flash_command(cmd):
             yield line
+
+    async def flash_dfu(self, device_id: str, firmware_path: str, address: str = "0x08000000", leave: bool = True) -> AsyncGenerator[str, None]:
+        """Flashes a device in DFU mode using dfu-util."""
+        yield f">>> Flashing {firmware_path} via DFU to {address} (Leave: {leave})...\n"
+
+        # Prevent concurrent dfu-util calls (like UI polling dfu-util -l) while flashing.
+        async with self._dfu_lock:
+            # Invalidate any cached dfu-util -l results since the device will transition.
+            self._dfu_cache_time = 0.0
+
+            # We try to be specific if we have a serial or path
+            # device_id here could be the serial number or the path from discover_dfu_devices
+
+            # STRATEGY: We perform the download WITHOUT the :leave modifier first.
+            # Some STM32 bootloaders (like F446) can timeout on the 'get_status' call
+            # after a long erase/write if the :leave modifier is present.
+            # We also avoid mass-erase by default to preserve bootloaders.
+            cmd: List[str] = ["sudo", "dfu-util", "-a", "0", "-d", "0483:df11", "-s", address, "-D", firmware_path]
+
+            # If device_id looks like a serial number (usually alphanumeric, long)
+            # AND it is not a path (does not start with /dev/)
+            if device_id and len(device_id) > 5 and not device_id.startswith("/dev/"):
+                cmd.extend(["-S", device_id])
+            # If it looks like a path (e.g. 1-1.2)
+            elif device_id and "-" in device_id and not device_id.startswith("/dev/"):
+                cmd.extend(["-p", device_id])
+            elif device_id and device_id.startswith("/dev/"):
+                yield f">>> WARNING: Device ID '{device_id}' looks like a serial path, not a DFU ID. Skipping specific device selection.\n"
+
+            # Retry mechanism for the download phase
+            max_retries = 3
+            flash_success = False
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        yield f">>> Retry attempt {attempt + 1}/{max_retries}...\n"
+                        await asyncio.sleep(2)
+
+                    current_success = False
+                    async for line in self._run_flash_command(cmd):
+                        yield line
+                        if ">>> Flashing successful!" in line:
+                            current_success = True
+
+                    if current_success:
+                        flash_success = True
+                        break
+                except Exception as e:
+                    yield f">>> Error during flash attempt {attempt + 1}: {e}\n"
+
+            if not flash_success:
+                yield "!!! Flash operation failed after multiple attempts.\n"
+                return
+
+            # If successful and leave is requested, send a separate tiny command to exit DFU
+            if leave:
+                yield ">>> Sending DFU leave request to reboot device...\n"
+                # We use a 0-length download to the base address with :leave to trigger a reset
+                # We use -R as well for extra robustness on some bootloaders
+                leave_cmd: List[str] = ["sudo", "dfu-util", "-a", "0", "-d", "0483:df11", "-R", "-s", f"{address}:leave"]
+                if device_id and len(device_id) > 5 and not device_id.startswith("/dev/"):
+                    leave_cmd.extend(["-S", device_id])
+                elif device_id and "-" in device_id and not device_id.startswith("/dev/"):
+                    leave_cmd.extend(["-p", device_id])
+
+                # Run the leave command
+                # dfu-util can return non-zero here (commonly 251) because the device disconnects
+                # during detach/reset while switching back to runtime. Treat that as success.
+                async for line in self._run_flash_command(leave_cmd, ok_returncodes={0, 251}):
+                    if "Flashing successful" in line or "Done" in line:
+                        yield ">>> Device rebooted successfully.\n"
+                    else:
+                        yield line
+
+            yield ">>> Flash operation complete.\n"
+            self._dfu_cache_time = 0.0
 
     async def flash_linux(self, firmware_path: str) -> AsyncGenerator[str, None]:
         """'Flashes' the Linux process by installing the binary to /usr/local/bin/klipper_mcu."""
@@ -397,8 +881,8 @@ print("Jump command sent to UUID {device_id}")
             await asyncio.sleep(2)
             
             # 2. Copy to /usr/local/bin/klipper_mcu
-            cmd = ["sudo", "cp", firmware_path, "/usr/local/bin/klipper_mcu"]
-            process = await asyncio.create_subprocess_exec(
+            cmd: List[str] = ["sudo", "cp", firmware_path, "/usr/local/bin/klipper_mcu"]
+            process: Process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
@@ -409,16 +893,18 @@ print("Jump command sent to UUID {device_id}")
                 return
 
             # 2. Ensure it's executable
-            cmd = ["sudo", "chmod", "+x", "/usr/local/bin/klipper_mcu"]
-            process = await asyncio.create_subprocess_exec(*cmd)
+            cmd: List[str] = ["sudo", "chmod", "+x", "/usr/local/bin/klipper_mcu"]
+            process: Process = await asyncio.create_subprocess_exec(*cmd)
             await process.wait()
 
             yield ">>> Linux MCU binary installed successfully.\n"
         except Exception as e:
             yield f"!!! Error during Linux MCU installation: {str(e)}\n"
 
-    async def _run_flash_command(self, cmd: list) -> AsyncGenerator[str, None]:
-        process = await asyncio.create_subprocess_exec(
+    async def _run_flash_command(self, cmd: list, ok_returncodes: Optional[set[int]] = None) -> AsyncGenerator[str, None]:
+        if ok_returncodes is None:
+            ok_returncodes = {0}
+        process: Process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT
@@ -427,13 +913,13 @@ print("Jump command sent to UUID {device_id}")
         while True:
             if process.stdout is None:
                 break
-            line = await process.stdout.readline()
+            line: bytes = await process.stdout.readline()
             if not line:
                 break
             yield line.decode()
 
         await process.wait()
-        if process.returncode == 0:
+        if process.returncode in ok_returncodes:
             yield ">>> Flashing successful!\n"
         else:
             yield f">>> Flashing failed with return code {process.returncode}\n"

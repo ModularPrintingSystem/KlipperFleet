@@ -3,3 +3,4 @@ uvicorn
 kconfiglib
 python-multipart
 httpx
+pyserial

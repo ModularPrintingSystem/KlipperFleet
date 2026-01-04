@@ -1,22 +1,22 @@
-import subprocess
 import os
 import asyncio
 import shutil
 from typing import AsyncGenerator
+from asyncio.subprocess import Process
 
 class BuildManager:
-    def __init__(self, klipper_dir: str, artifacts_dir: str):
-        self.klipper_dir = klipper_dir
-        self.artifacts_dir = artifacts_dir
+    def __init__(self, klipper_dir: str, artifacts_dir: str) -> None:
+        self.klipper_dir: str = klipper_dir
+        self.artifacts_dir: str = artifacts_dir
         os.makedirs(self.artifacts_dir, exist_ok=True)
 
     async def run_build(self, config_path: str) -> AsyncGenerator[str, None]:
         """Runs the Klipper build process and yields output line by line."""
-        profile_name = os.path.basename(config_path).replace(".config", "")
+        profile_name: str = os.path.basename(config_path).replace(".config", "")
         
         # Klipper's Makefile doesn't handle spaces in KCONFIG_CONFIG well.
         # We copy the profile to the standard .config location in the klipper directory.
-        tmp_config = os.path.join(self.klipper_dir, ".config")
+        tmp_config: str = os.path.join(self.klipper_dir, ".config")
         try:
             shutil.copy(config_path, tmp_config)
         except Exception as e:
@@ -41,7 +41,7 @@ class BuildManager:
 
         # 3. Build
         yield ">>> Starting build...\n"
-        process = await asyncio.create_subprocess_exec(
+        process: Process = await asyncio.create_subprocess_exec(
             "make",
             cwd=self.klipper_dir,
             stdout=asyncio.subprocess.PIPE,
@@ -49,18 +49,21 @@ class BuildManager:
         )
 
         while True:
-            line = await process.stdout.readline()
-            if not line:
+            if process.stdout:
+                line: bytes = await process.stdout.readline()
+                if not line:
+                    break
+                yield line.decode()
+            else:
                 break
-            yield line.decode()
 
         await process.wait()
         if process.returncode == 0:
             yield ">>> Build successful!\n"
             
             # Copy artifacts to persistent storage
-            bin_src = os.path.join(self.klipper_dir, "out", "klipper.bin")
-            elf_src = os.path.join(self.klipper_dir, "out", "klipper.elf")
+            bin_src: str = os.path.join(self.klipper_dir, "out", "klipper.bin")
+            elf_src: str = os.path.join(self.klipper_dir, "out", "klipper.elf")
             
             if os.path.exists(bin_src):
                 shutil.copy(bin_src, os.path.join(self.artifacts_dir, f"{profile_name}.bin"))
@@ -71,9 +74,9 @@ class BuildManager:
         else:
             yield f">>> Build failed with return code {process.returncode}\n"
 
-    async def _run_command(self, cmd: list, timeout: int = 60):
+    async def _run_command(self, cmd: list, timeout: int = 60) -> None:
         try:
-            process = await asyncio.create_subprocess_exec(
+            process: Process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=self.klipper_dir,
                 stdout=asyncio.subprocess.DEVNULL,
