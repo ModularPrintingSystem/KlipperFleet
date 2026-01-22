@@ -407,6 +407,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 "method": dev['method'], 
                                 "name": dev['name'],
                                 "use_magic_baud": dev.get('use_magic_baud', False),
+                                "interface": dev.get('interface', 'can0'),
                                 "dfu_id": dev.get('dfu_id')
                             })
 
@@ -444,14 +445,16 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                     for i in range(wait_time // 2): 
                         if task_store.is_cancelled(task_id): return
                         await asyncio.sleep(2)
+
+                        interfaces_in_task = set(d['interface'] for d in reboot_tasks if d['method'] == 'can')
                         
                         # Check if CAN interface is still up
-                        if not await flash_mgr.is_interface_up("can0"):
-                            # If we are waiting for CAN devices, this is a problem
-                            if any(d['method'] == 'can' for d in reboot_tasks):
-                                task_store.add_log(task_id, "!!! CAN interface (can0) is DOWN. A bridge may have rebooted unexpectedly.\n")
-                                task_store.add_log(task_id, ">>> Attempting to bring can0 back up...\n")
-                                await flash_mgr.ensure_canbus_up("can0")
+                        for interface in interfaces_in_task:
+                            if not await flash_mgr.is_interface_up(interface):
+                                # If we are waiting for CAN devices, this is a problem
+                                task_store.add_log(task_id, f"!!! CAN interface ({interface}) is DOWN. A bridge may have rebooted unexpectedly.\n")
+                                task_store.add_log(task_id, f">>> Attempting to bring {interface} back up...\n")
+                                await flash_mgr.ensure_canbus_up(interface)
 
                         ready_count = 0
                         for dev_info in reboot_tasks:
@@ -646,7 +649,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
                             elif dev['method'] == "can":
-                                async for log in flash_mgr.flash_can(dev['id'], firmware_path):
+                                async for log in flash_mgr.flash_can(dev['id'], firmware_path, dev.get('interface', 'can0')):
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
                             elif dev['method'] == "dfu":
