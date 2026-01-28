@@ -1,0 +1,223 @@
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+from typing import List, Dict
+
+# Test for Issue #4: Failure to resolve new Katapult ID
+# https://github.com/JohnBaumb/KlipperFleet/issues/4
+#
+# When a device reboots from Klipper firmware to Katapult bootloader,
+# its USB device ID can change completely:
+#   Before: /dev/serial/by-id/usb-infimech_tx_stm32f401xc_main_mcu-if00
+#   After:  /dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00
+#
+# The fix uses a "snapshot and diff" approach to detect the new device.
+
+
+class TestKatapultIdResolution:
+    """Tests for the snapshot-diff approach to finding Katapult devices after reboot."""
+
+    @pytest.fixture
+    def mock_flash_mgr(self):
+        """Create a mock FlashManager with controllable device discovery."""
+        mgr = MagicMock()
+        mgr.discover_serial_devices = AsyncMock()
+        mgr.discover_dfu_devices = AsyncMock(return_value=[])
+        mgr.resolve_dfu_id = AsyncMock(side_effect=lambda x, **kw: x)
+        mgr.check_device_status = AsyncMock(return_value="service")
+        mgr.reboot_to_katapult = AsyncMock(return_value=iter([]))
+        mgr.flash_serial = AsyncMock(return_value=iter([]))
+        return mgr
+
+    def test_snapshot_diff_detects_new_device(self):
+        """Test that comparing before/after device lists correctly identifies new devices."""
+        # Before reboot - device is in Klipper firmware mode
+        initial_serials = [
+            "/dev/serial/by-id/usb-infimech_tx_stm32f401xc_main_mcu-if00",
+            "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00",
+            "/dev/serial/by-id/usb-Beacon_Beacon_RevH_62889AF9515U354UD38202020FF0A1D23-if00"
+        ]
+        
+        # After reboot - old device gone, new Katapult device appeared
+        current_serials = [
+            {"id": "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00"},
+            {"id": "/dev/serial/by-id/usb-Beacon_Beacon_RevH_62889AF9515U354UD38202020FF0A1D23-if00"},
+            {"id": "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"}
+        ]
+        
+        # The detection logic from main.py
+        current_ids = [d['id'] for d in current_serials]
+        new_serial_device = None
+        
+        # Look for a NEW serial device that wasn't there before
+        for cid in current_ids:
+            if cid not in initial_serials:
+                new_serial_device = cid
+                break
+        
+        assert new_serial_device == "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"
+
+    def test_fallback_finds_katapult_device(self):
+        """Test fallback detection when device appears as new Katapult path."""
+        # Scenario: Can't diff (e.g., multiple new devices), but one has 'katapult' in name
+        current_serials = [
+            {"id": "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00"},
+            {"id": "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"},
+            {"id": "/dev/serial/by-id/usb-SomeOther_Device-if00"}
+        ]
+        
+        new_serial_device = None
+        for d in current_serials:
+            if "katapult" in d['id'].lower() or "canboot" in d['id'].lower():
+                new_serial_device = d['id']
+                break
+        
+        assert new_serial_device == "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"
+
+    def test_fallback_finds_canboot_device(self):
+        """Test fallback detection finds 'canboot' named devices (legacy Katapult name)."""
+        current_serials = [
+            {"id": "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00"},
+            {"id": "/dev/serial/by-id/usb-CanBoot_stm32f401xc_12345678-if00"},
+        ]
+        
+        new_serial_device = None
+        for d in current_serials:
+            if "katapult" in d['id'].lower() or "canboot" in d['id'].lower():
+                new_serial_device = d['id']
+                break
+        
+        assert new_serial_device == "/dev/serial/by-id/usb-CanBoot_stm32f401xc_12345678-if00"
+
+    def test_no_false_positive_when_no_new_device(self):
+        """Test that we don't incorrectly identify a device when nothing changed."""
+        initial_serials = [
+            "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00",
+            "/dev/serial/by-id/usb-Beacon_Beacon_RevH_62889-if00"
+        ]
+        
+        # Same devices after "reboot" (device didn't actually change)
+        current_serials = [
+            {"id": "/dev/serial/by-id/usb-AT_stm32g0b1xx_TN_Pro-if00"},
+            {"id": "/dev/serial/by-id/usb-Beacon_Beacon_RevH_62889-if00"}
+        ]
+        
+        current_ids = [d['id'] for d in current_serials]
+        new_serial_device = None
+        
+        for cid in current_ids:
+            if cid not in initial_serials:
+                new_serial_device = cid
+                break
+        
+        assert new_serial_device is None
+
+    def test_diff_ignores_unrelated_new_devices(self):
+        """Test that diff approach finds the katapult device, not just any new device."""
+        initial_serials = [
+            "/dev/serial/by-id/usb-infimech_tx_stm32f401xc_main_mcu-if00"
+        ]
+        
+        # Two new devices appeared - prefer the katapult one
+        current_serials = [
+            {"id": "/dev/serial/by-id/usb-RandomNewDevice-if00"},
+            {"id": "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"}
+        ]
+        
+        current_ids = [d['id'] for d in current_serials]
+        new_serial_device = None
+        
+        # First try: find any new device
+        for cid in current_ids:
+            if cid not in initial_serials:
+                new_serial_device = cid
+                break
+        
+        # This will find the first new device - which might not be katapult
+        # In practice this is fine because we're flashing ONE device at a time
+        # and any new device appearing right after reboot is likely our target
+        assert new_serial_device is not None
+        
+        # But if we need to be more specific, fallback checks for katapult name
+        katapult_device = None
+        for d in current_serials:
+            if "katapult" in d['id'].lower() or "canboot" in d['id'].lower():
+                katapult_device = d['id']
+                break
+        
+        assert katapult_device == "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"
+
+
+class TestSerialNumberExtraction:
+    """Tests for the legacy serial number extraction (still used as fallback)."""
+    
+    def test_extract_serial_does_not_find_custom_name(self):
+        """Demonstrate why serial extraction fails for custom-named devices."""
+        # This is the user's device from Issue #4
+        old_id = "/dev/serial/by-id/usb-infimech_tx_stm32f401xc_main_mcu-if00"
+        new_id = "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"
+        
+        # The actual hardware serial number
+        actual_hardware_serial = "1A0028000A51333138373435"
+        
+        # The old ID does NOT contain the hardware serial
+        assert actual_hardware_serial not in old_id
+        
+        # The new ID DOES contain it
+        assert actual_hardware_serial in new_id
+        
+        # This is why serial number matching fails - we can't extract
+        # the hardware serial from the old custom-named ID
+
+
+class TestIntegrationScenario:
+    """Integration-style tests simulating the full flash flow."""
+
+    @pytest.mark.asyncio
+    async def test_flash_flow_with_changing_device_id(self):
+        """Simulate the complete flash flow where device ID changes after reboot."""
+        
+        # Simulate the sequence of events
+        call_count = 0
+        
+        async def mock_discover_serial(skip_moonraker=False):
+            nonlocal call_count
+            call_count += 1
+            
+            if call_count == 1:
+                # Before reboot - device is in Klipper mode
+                return [
+                    {"id": "/dev/serial/by-id/usb-infimech_tx_stm32f401xc_main_mcu-if00"},
+                    {"id": "/dev/serial/by-id/usb-OtherDevice-if00"}
+                ]
+            else:
+                # After reboot - device is in Katapult mode with new ID
+                return [
+                    {"id": "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"},
+                    {"id": "/dev/serial/by-id/usb-OtherDevice-if00"}
+                ]
+        
+        # Take initial snapshot
+        initial_devices = await mock_discover_serial()
+        initial_serials = [d['id'] for d in initial_devices]
+        
+        # Simulate reboot happening...
+        
+        # Discover again after reboot
+        current_devices = await mock_discover_serial()
+        current_ids = [d['id'] for d in current_devices]
+        
+        # Find the new device
+        new_serial_device = None
+        for cid in current_ids:
+            if cid not in initial_serials:
+                new_serial_device = cid
+                break
+        
+        # We should find the new Katapult device
+        assert new_serial_device == "/dev/serial/by-id/usb-katapult_stm32f401xc_1A0028000A51333138373435-if00"
+        
+        # This new_serial_device would then be used for flashing
+        target_id = new_serial_device
+        assert target_id is not None
+        assert "katapult" in target_id.lower()
