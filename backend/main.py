@@ -133,6 +133,7 @@ class Device(BaseModel):
     profile: str
     method: str
     interface: Optional[str] = "can0"
+    baudrate: Optional[int] = 250000  # Serial baudrate for Katapult flashtool.py (common: 115200, 250000, 500000)
     notes: Optional[str] = ""
     is_katapult: bool = False
     is_bridge: bool = False
@@ -148,6 +149,7 @@ class FlashRequest(BaseModel):
     device_id: str
     method: str # "serial", "can", "dfu", "linux"
     dfu_id: Optional[str] = None
+    baudrate: Optional[int] = 250000  # Serial baudrate for Katapult
     use_magic_baud: Optional[bool] = False
     use_dfu_exit: Optional[bool] = True
 
@@ -431,6 +433,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 "name": dev['name'],
                                 "use_magic_baud": dev.get('use_magic_baud', False),
                                 "interface": dev.get('interface', 'can0'),
+                                "baudrate": dev.get('baudrate', 250000),
                                 "dfu_id": dev.get('dfu_id')
                             })
 
@@ -459,7 +462,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 has_manual_dfu = True
                         else:
                             task_store.add_log(task_id, f">>> Requesting Katapult reboot for {dev_info['name']} ({dev_info['id']})...\n")
-                            async for log in flash_mgr.reboot_to_katapult(dev_info['id'], dev_info['method'], is_bridge=False):
+                            async for log in flash_mgr.reboot_to_katapult(dev_info['id'], dev_info['method'], is_bridge=False, baudrate=dev_info.get('baudrate', 250000)):
                                 if task_store.is_cancelled(task_id): return
                                 task_store.add_log(task_id, log)
                     
@@ -613,7 +616,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 task_store.add_log(task_id, f">>> Rebooting Bridge Host {dev['name']} to Katapult...\n")
                                 
                                 # 1. Trigger the reboot
-                                async for log in flash_mgr.reboot_to_katapult(dev['id'], dev['method'], dev.get('interface', 'can0'), is_bridge=True):
+                                async for log in flash_mgr.reboot_to_katapult(dev['id'], dev['method'], dev.get('interface', 'can0'), is_bridge=True, baudrate=dev.get('baudrate', 250000)):
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
 
@@ -672,7 +675,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 if resolved_id != dev['id']:
                                     task_store.add_log(task_id, f">>> Resolved serial ID: {dev['id']} -> {resolved_id}\n")
                                 
-                                async for log in flash_mgr.flash_serial(resolved_id, firmware_path):
+                                async for log in flash_mgr.flash_serial(resolved_id, firmware_path, baudrate=dev.get('baudrate', 250000)):
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
                             elif dev['method'] == "can":
@@ -949,18 +952,18 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
             yield await manage_klipper_services("stop")
             services_stopped = True
 
-            # get the interface type for the requested device
-            # Query the fleet to determine the interface for this device (default to can0)
+            # Query the fleet to determine the interface and baudrate for this device
             interface = "can0"
-            if req.method == "can":
-                try:
-                    fleet = fleet_mgr.get_fleet()
-                    for d in fleet:
-                        if d.get("id") == req.device_id:
-                            interface = d.get("interface", interface)
-                            break
-                except Exception:
-                    pass
+            baudrate = req.baudrate if req.baudrate else 250000
+            try:
+                fleet = fleet_mgr.get_fleet()
+                for d in fleet:
+                    if d.get("id") == req.device_id:
+                        interface = d.get("interface", interface)
+                        baudrate = d.get("baudrate", baudrate)
+                        break
+            except Exception:
+                pass
 
             # Snapshot current serial devices BEFORE reboot (for diff-based detection)
             initial_serials: List[str] = [d['id'] for d in await flash_mgr.discover_serial_devices(skip_moonraker=True)]
@@ -997,7 +1000,7 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
                             return
                 else:
                     yield f">>> Rebooting {req.device_id} to Katapult mode...\n"
-                    async for log in flash_mgr.reboot_to_katapult(req.device_id, method=req.method):
+                    async for log in flash_mgr.reboot_to_katapult(req.device_id, method=req.method, baudrate=baudrate):
                         if task_store.is_cancelled(task_id): return
                         yield log
                 
@@ -1082,7 +1085,7 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
             task_store.update_device_status(task_id, req.device_id, "flashing")
             try:
                 if actual_method == "serial":
-                    async for log in flash_mgr.flash_serial(target_id, firmware_path):
+                    async for log in flash_mgr.flash_serial(target_id, firmware_path, baudrate=baudrate):
                         if task_store.is_cancelled(task_id): return
                         yield log
                 elif actual_method == "can":

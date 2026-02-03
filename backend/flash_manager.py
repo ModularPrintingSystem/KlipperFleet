@@ -804,7 +804,7 @@ print("Jump command sent to UUID {device_id}")
                 # but usually serial devices jump to app after flash or timeout.
                 yield f">>> Serial device {device_id} will return to service after flash or timeout.\n"
 
-    async def reboot_to_katapult(self, device_id: str, method: str = "can", interface: str = "can0", is_bridge: bool = False) -> AsyncGenerator[str, None]:
+    async def reboot_to_katapult(self, device_id: str, method: str = "can", interface: str = "can0", is_bridge: bool = False, baudrate: int = 250000) -> AsyncGenerator[str, None]:
         """Sends a reboot command to a device to enter Katapult."""
         yield f">>> Requesting reboot to Katapult for {device_id}...\n"
         method = method.lower()
@@ -850,6 +850,7 @@ print("Jump command sent to UUID {device_id}")
             cmd: List[str] = [
                 "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
                 "-d", device_id,
+                "-b", str(baudrate),
                 "-r"
             ]
             
@@ -891,13 +892,14 @@ print("Jump command sent to UUID {device_id}")
             yield f">>> Error sending 1200bps magic baud: {str(e)}\n"
             yield ">>> Please manually enter DFU mode (BOOT0 + RESET) if the device does not appear.\n"
 
-    async def flash_serial(self, device_id: str, firmware_path: str) -> AsyncGenerator[str, None]:
+    async def flash_serial(self, device_id: str, firmware_path: str, baudrate: int = 250000) -> AsyncGenerator[str, None]:
         """Flashes a device via Serial using Katapult."""
-        yield f">>> Flashing {firmware_path} to {device_id} via Serial...\n"
+        yield f">>> Flashing {firmware_path} to {device_id} via Serial (baud {baudrate})...\n"
         cmd: List[str] = [
             "python3", os.path.join(self.katapult_dir, "scripts", "flashtool.py"),
             "-f", firmware_path,
-            "-d", device_id
+            "-d", device_id,
+            "-b", str(baudrate)
         ]
         async for line in self._run_flash_command(cmd):
             yield line
