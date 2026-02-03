@@ -141,6 +141,7 @@ class Device(BaseModel):
     use_magic_baud: bool = False
     dfu_exit_tested: bool = False
     use_dfu_exit: bool = False
+    exclude_from_batch: bool = False
 
 class FlashRequest(BaseModel):
     profile: str
@@ -162,6 +163,11 @@ async def get_status() -> Dict[str, Any]:
         "klipper_dir": KLIPPER_DIR,
         "is_klipper_kconfiglib": kconfig_mgr.is_klipper_kconfiglib
     }
+
+@app.get("/klipper/version")
+async def get_klipper_version() -> Dict[str, str]:
+    """Returns the host Klipper git version information."""
+    return await build_mgr.get_klipper_version()
 
 class ConfigPreview(BaseModel):
     profile: Optional[str] = None
@@ -349,6 +355,10 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
 
     async def run_task() -> None:
         services_stopped = False
+        # Result tracking for summary
+        build_results: Dict[str, str] = {}  # profile -> "SUCCESS"/"FAILED"
+        flash_results: Dict[str, str] = {}  # device_name -> "SUCCESS"/"SKIPPED"/"FAILED"
+        
         try:
             devices: List[Dict[str, Any]] = fleet_mgr.get_fleet()
             
@@ -364,9 +374,13 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                         if task_store.is_cancelled(task_id): return
                         task_store.add_log(task_id, f"\n>>> BATCH BUILD: Starting {profile}...\n")
                         config_path: str = os.path.join(PROFILES_DIR, f"{profile}.config")
+                        build_success = True
                         async for log in build_mgr.run_build(config_path):
                             if task_store.is_cancelled(task_id): return
                             task_store.add_log(task_id, log)
+                            if "!!! Error" in log or "!!! Build failed" in log:
+                                build_success = False
+                        build_results[profile] = "SUCCESS" if build_success else "FAILED"
                         task_store.add_log(task_id, f">>> BATCH BUILD: Finished {profile}\n")
             
             # 2. Flash phase
@@ -374,6 +388,15 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                 if task_store.is_cancelled(task_id): return
                 task_store.tasks[task_id]["is_bus_task"] = True
                 task_store.add_log(task_id, "\n>>> BATCH FLASH: Starting...\n")
+                
+                # Filter out devices excluded from batch operations
+                excluded_devices = [d for d in devices if d.get('exclude_from_batch', False)]
+                devices = [d for d in devices if not d.get('exclude_from_batch', False)]
+                if excluded_devices:
+                    excluded_names = ', '.join(d['name'] for d in excluded_devices)
+                    task_store.add_log(task_id, f">>> Excluding from batch: {excluded_names}\n")
+                    for excl_dev in excluded_devices:
+                        flash_results[excl_dev['name']] = "EXCLUDED"
                 
                 task_store.add_log(task_id, ">>> Checking device statuses before stopping services...\n")
                 # Pre-discover CAN devices while Moonraker is still running to identify "In Service" nodes
@@ -407,6 +430,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                 "method": dev['method'], 
                                 "name": dev['name'],
                                 "use_magic_baud": dev.get('use_magic_baud', False),
+                                "interface": dev.get('interface', 'can0'),
                                 "dfu_id": dev.get('dfu_id')
                             })
 
@@ -444,14 +468,16 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                     for i in range(wait_time // 2): 
                         if task_store.is_cancelled(task_id): return
                         await asyncio.sleep(2)
+
+                        interfaces_in_task = set(d['interface'] for d in reboot_tasks if d['method'] == 'can')
                         
                         # Check if CAN interface is still up
-                        if not await flash_mgr.is_interface_up("can0"):
-                            # If we are waiting for CAN devices, this is a problem
-                            if any(d['method'] == 'can' for d in reboot_tasks):
-                                task_store.add_log(task_id, "!!! CAN interface (can0) is DOWN. A bridge may have rebooted unexpectedly.\n")
-                                task_store.add_log(task_id, ">>> Attempting to bring can0 back up...\n")
-                                await flash_mgr.ensure_canbus_up("can0")
+                        for interface in interfaces_in_task:
+                            if not await flash_mgr.is_interface_up(interface):
+                                # If we are waiting for CAN devices, this is a problem
+                                task_store.add_log(task_id, f"!!! CAN interface ({interface}) is DOWN. A bridge may have rebooted unexpectedly.\n")
+                                task_store.add_log(task_id, f">>> Attempting to bring {interface} back up...\n")
+                                await flash_mgr.ensure_canbus_up(interface)
 
                         ready_count = 0
                         for dev_info in reboot_tasks:
@@ -581,6 +607,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                     task_store.add_log(task_id, f">>> Bridge is now in DFU mode: {dev['id']}\n")
                                 else:
                                     task_store.add_log(task_id, "!!! Bridge did not enter DFU mode. Skipping.\n")
+                                    flash_results[dev['name']] = "FAILED (DFU timeout)"
                                     continue
                             else:
                                 task_store.add_log(task_id, f">>> Rebooting Bridge Host {dev['name']} to Katapult...\n")
@@ -621,10 +648,12 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                     task_store.add_log(task_id, f">>> Bridge is now ready: {dev['id']}\n")
                                 else:
                                     task_store.add_log(task_id, "!!! Bridge did not enter Katapult mode. Skipping.\n")
+                                    flash_results[dev['name']] = "FAILED (Katapult timeout)"
                                     continue
 
                         if status not in ["ready", "dfu"] and dev['method'] != "linux":
                             task_store.add_log(task_id, f"!!! Skipping {dev['name']} ({dev['id']}) - Device is {status}, not ready for flashing.\n")
+                            flash_results[dev['name']] = f"SKIPPED ({status})"
                             continue
 
                         task_store.add_log(task_id, f"\n>>> FLASHING {dev['name']} ({dev['id']}) with {dev['profile']}...\n")
@@ -632,6 +661,7 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                         
                         if not os.path.exists(firmware_path):
                             task_store.add_log(task_id, f"!!! Error: Firmware for {dev['profile']} not found. Skipping.\n")
+                            flash_results[dev['name']] = "FAILED (no firmware)"
                             continue
                             
                         task_store.update_device_status(task_id, dev['id'], "flashing")
@@ -646,7 +676,10 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
                             elif dev['method'] == "can":
-                                async for log in flash_mgr.flash_can(dev['id'], firmware_path):
+                                interface = dev.get('interface', 'can0')
+                                if not await flash_mgr.is_interface_up(interface):
+                                    raise IOError(f"CAN interface ({interface}) is DOWN. Cannot flash device.")
+                                async for log in flash_mgr.flash_can(dev['id'], firmware_path, interface):
                                     if task_store.is_cancelled(task_id): return
                                     task_store.add_log(task_id, log)
                             elif dev['method'] == "dfu":
@@ -661,13 +694,42 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
                                     task_store.add_log(task_id, log)
                             
                             task_store.update_device_status(task_id, dev['id'], "ready")
+                            flash_results[dev['name']] = "SUCCESS"
                         except Exception as e:
                             task_store.add_log(task_id, f"!!! Error flashing {dev['name']}: {str(e)}\n")
                             task_store.update_device_status(task_id, dev['id'], "failed")
+                            flash_results[dev['name']] = "FAILED"
                     else:
                         task_store.add_log(task_id, f">>> Skipping {dev['name']} (Status: {status})\n")
+                        flash_results[dev['name']] = "SKIPPED"
                 
                 task_store.add_log(task_id, "\n>>> BATCH FLASH COMPLETED <<<\n")
+            
+            # Generate summary
+            task_store.add_log(task_id, "\n")
+            task_store.add_log(task_id, "======================== [SUMMARY] ========================\n")
+            
+            # Build summary
+            if build_results:
+                task_store.add_log(task_id, "\n  BUILD RESULTS:\n")
+                for profile, result in build_results.items():
+                    if result == "SUCCESS":
+                        task_store.add_log(task_id, f"  [COLOR:GREEN]  - {profile}: {result}[/COLOR]\n")
+                    else:
+                        task_store.add_log(task_id, f"  [COLOR:RED]  - {profile}: {result}[/COLOR]\n")
+            
+            # Flash summary
+            if flash_results:
+                task_store.add_log(task_id, "\n  FLASH RESULTS:\n")
+                for device_name, result in flash_results.items():
+                    if result == "SUCCESS":
+                        task_store.add_log(task_id, f"  [COLOR:GREEN]  - {device_name}: {result}[/COLOR]\n")
+                    elif result.startswith("SKIPPED") or result == "EXCLUDED":
+                        task_store.add_log(task_id, f"  [COLOR:YELLOW]  - {device_name}: {result}[/COLOR]\n")
+                    else:
+                        task_store.add_log(task_id, f"  [COLOR:RED]  - {device_name}: {result}[/COLOR]\n")
+            
+            task_store.add_log(task_id, "\n===========================================================\n")
                 
             task_store.add_log(task_id, "\n>>> ALL BATCH OPERATIONS COMPLETED <<<\n")
             
@@ -803,6 +865,44 @@ async def remove_device(device_id: str) -> Dict[str, str]:
     fleet_mgr.remove_device(device_id)
     return {"message": "Device removed from fleet"}
 
+@app.get("/fleet/versions")
+async def get_fleet_versions() -> Dict[str, Any]:
+    """Gets live version information for all fleet devices that are in service."""
+    fleet = fleet_mgr.get_fleet()
+    mcu_versions = await flash_mgr.get_mcu_versions()
+    
+    version_info: Dict[str, Any] = {}
+    for dev in fleet:
+        device_id = dev['id']
+        dev_info: Dict[str, Any] = {
+            "flashed_version": dev.get('flashed_version'),
+            "flashed_commit": dev.get('flashed_commit'),
+            "last_flashed": dev.get('last_flashed'),
+            "live_version": None
+        }
+        
+        # Try to find live version by device ID or check all MCU identifiers
+        if device_id in mcu_versions:
+            dev_info["live_version"] = mcu_versions[device_id].get("version")
+        else:
+            # Try to match by looking at all MCU identifiers
+            for mcu_id, mcu_info in mcu_versions.items():
+                if mcu_info.get("identifier") == device_id:
+                    dev_info["live_version"] = mcu_info.get("version")
+                    break
+        
+        # Special handling for Linux MCU - look for "mcu rpi" or any MCU with MCU="linux"
+        if dev.get('method') == 'linux' and dev_info["live_version"] is None:
+            for mcu_id, mcu_info in mcu_versions.items():
+                mcu_constants = mcu_info.get("mcu_constants", {})
+                if mcu_constants.get("MCU") == "linux" or "rpi" in mcu_id.lower() or "host" in mcu_id.lower():
+                    dev_info["live_version"] = mcu_info.get("version")
+                    break
+        
+        version_info[device_id] = dev_info
+    
+    return version_info
+
 @app.get("/devices/discover")
 async def discover_devices() -> Dict[str, List[Dict[str, Any]]]:
     """Discovers Serial, CAN, DFU, and Linux process devices."""
@@ -849,12 +949,25 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
             yield await manage_klipper_services("stop")
             services_stopped = True
 
+            # get the interface type for the requested device
+            # Query the fleet to determine the interface for this device (default to can0)
+            interface = "can0"
+            if req.method == "can":
+                try:
+                    fleet = fleet_mgr.get_fleet()
+                    for d in fleet:
+                        if d.get("id") == req.device_id:
+                            interface = d.get("interface", interface)
+                            break
+                except Exception:
+                    pass
+
             # Snapshot current serial devices BEFORE reboot (for diff-based detection)
             initial_serials: List[str] = [d['id'] for d in await flash_mgr.discover_serial_devices(skip_moonraker=True)]
             new_serial_device: Optional[str] = None
 
             # 1. Check current status
-            status: str = await flash_mgr.check_device_status(req.device_id, req.method, dfu_id=req.dfu_id)
+            status: str = await flash_mgr.check_device_status(req.device_id, req.method, dfu_id=req.dfu_id, interface=interface)
             task_store.update_device_status(task_id, req.device_id, status)
             
             # 2. Reboot if in service
@@ -973,12 +1086,12 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
                         if task_store.is_cancelled(task_id): return
                         yield log
                 elif actual_method == "can":
-                    async for log in flash_mgr.flash_can(target_id, firmware_path):
+                    async for log in flash_mgr.flash_can(target_id, firmware_path, interface=interface):
                         if task_store.is_cancelled(task_id): return
                         yield log
                 elif actual_method == "dfu":
                     offset: str = get_flash_offset(req.profile)
-                    async for log in flash_mgr.flash_dfu(target_id, firmware_path, address=offset, leave=req.use_dfu_exit):
+                    async for log in flash_mgr.flash_dfu(target_id, firmware_path, address=offset, leave=req.use_dfu_exit if req.use_dfu_exit is not None else True):
                         if task_store.is_cancelled(task_id): return
                         yield log
                 elif actual_method == "linux":
@@ -987,6 +1100,12 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
                         yield log
                 
                 task_store.update_device_status(task_id, req.device_id, "ready")
+                
+                # Update version info in fleet after successful flash
+                build_info = build_mgr.get_last_build_info(req.profile)
+                if build_info:
+                    fleet_mgr.update_device_version(req.device_id, build_info)
+                    yield f">>> Version recorded: {build_info.get('version', 'unknown')} ({build_info.get('commit', 'unknown')})\n"
             except Exception as e:
                 yield f"!!! Error during flash: {str(e)}\n"
                 task_store.update_device_status(task_id, req.device_id, "failed")
