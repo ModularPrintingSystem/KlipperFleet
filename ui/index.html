@@ -471,11 +471,10 @@
                                                 <input type="checkbox" v-model="dev.is_katapult" @change="updateFleetDevice(dev)" class="h-3 w-3 rounded border-gray-700 bg-gray-900 text-blue-600 focus:ring-blue-500">
                                                 <span class="text-[10px] text-gray-400 group-hover:text-gray-200 uppercase font-bold">Katapult</span>
                                             </label>
-                                            <label v-if="!isProfileLinux(dev)" class="flex items-center space-x-2 cursor-pointer group" :class="{'opacity-60 cursor-not-allowed': isProfileCanBridge(dev)}">
-                                                <input type="checkbox" :checked="dev.is_bridge || isProfileCanBridge(dev)" @change="dev.is_bridge = $event.target.checked; updateFleetDevice(dev)" :disabled="isProfileCanBridge(dev)" class="h-3 w-3 rounded border-gray-700 bg-gray-900 text-blue-600 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed">
-                                                <span class="text-[10px] text-gray-400 group-hover:text-gray-200 uppercase font-bold">CAN Bridge</span>
-                                                <span v-if="isProfileCanBridge(dev)" class="text-[8px] text-blue-400 font-bold">(auto)</span>
-                                            </label>
+                                            <span v-if="isProfileCanBridge(dev)" class="flex items-center space-x-1.5 text-[10px] uppercase font-bold text-blue-400" title="Auto-detected from profile: Communication interface is set to USB to CAN bus bridge">
+                                                <i class="fas fa-check-circle text-[8px]"></i>
+                                                <span>CAN Bridge</span>
+                                            </span>
                                         </div>
                                         <label class="flex items-center space-x-2 cursor-pointer group" title="This device will only be flashed when done individually. It will be skipped during Flash All, Build & Flash Ready, and Build & Flash All operations.">
                                             <input type="checkbox" v-model="dev.exclude_from_batch" @change="updateFleetDevice(dev)" class="h-3 w-3 rounded border-gray-700 bg-gray-900 text-orange-600 focus:ring-orange-500">
@@ -868,8 +867,9 @@
                         const info = profileInfo.value[dev.profile];
                         if (!info) continue;
                         let needsUpdate = false;
-                        if (info.is_can_bridge && !dev.is_bridge) {
-                            dev.is_bridge = true;
+                        const shouldBeBridge = !!info.is_can_bridge;
+                        if (dev.is_bridge !== shouldBeBridge) {
+                            dev.is_bridge = shouldBeBridge;
                             needsUpdate = true;
                         }
                         if (info.is_linux && dev.method !== 'linux') {
@@ -1546,12 +1546,12 @@
                 const onDeviceProfileChange = async (dev) => {
                     const info = profileInfo.value[dev.profile];
                     if (info) {
-                        if (info.is_can_bridge) {
-                            dev.is_bridge = true;
-                        }
+                        dev.is_bridge = !!info.is_can_bridge;
                         if (info.is_linux) {
                             dev.method = 'linux';
                         }
+                    } else {
+                        dev.is_bridge = false;
                     }
                     await updateFleetDevice(dev);
                 };
