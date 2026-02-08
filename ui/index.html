@@ -79,7 +79,10 @@
                     <span v-if="building || flashing" class="flex items-center text-orange-400 text-xs md:text-sm ml-auto md:ml-0">
                         <i class="fas fa-circle-notch fa-spin mr-1 md:mr-2"></i> <span class="hidden sm:inline">Processing...</span>
                     </span>
-                    <span v-if="querying && !building && !flashing" class="flex items-center text-blue-400 text-xs md:text-sm ml-auto md:ml-0">
+                    <span v-if="printing && !building && !flashing" class="flex items-center text-yellow-400 text-xs md:text-sm ml-auto md:ml-0" :title="'Printing: ' + printFilename">
+                        <i class="fas fa-print mr-1 md:mr-2"></i> <span class="hidden sm:inline">{{ printState === 'paused' ? 'Print Paused' : 'Printing' }} &mdash; Flashing Disabled</span>
+                    </span>
+                    <span v-if="querying && !building && !flashing && !printing" class="flex items-center text-blue-400 text-xs md:text-sm ml-auto md:ml-0">
                         <i class="fas fa-search fa-spin mr-1 md:mr-2"></i> <span class="hidden sm:inline">Querying...</span>
                     </span>
                 </div>
@@ -87,13 +90,13 @@
                     <button @click="runBatch('build-all')" :disabled="building || flashing" class="bg-gray-700 hover:bg-gray-600 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
                         Build All
                     </button>
-                    <button @click="runBatch('flash-all')" :disabled="building || flashing" class="bg-gray-700 hover:bg-gray-600 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
+                    <button @click="runBatch('flash-all')" :disabled="building || flashing || printing" class="bg-gray-700 hover:bg-gray-600 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
                         Flash All
                     </button>
-                    <button @click="runBatch('build-flash-ready')" :disabled="building || flashing" class="bg-orange-600 hover:bg-orange-700 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
+                    <button @click="runBatch('build-flash-ready')" :disabled="building || flashing || printing" class="bg-orange-600 hover:bg-orange-700 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
                         Build & Flash Ready
                     </button>
-                    <button @click="runBatch('build-flash-all')" :disabled="building || flashing" class="bg-red-700 hover:bg-red-800 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
+                    <button @click="runBatch('build-flash-all')" :disabled="building || flashing || printing" class="bg-red-700 hover:bg-red-800 text-white px-2 md:px-3 py-1 rounded text-[9px] md:text-[10px] font-bold disabled:opacity-50 uppercase whitespace-nowrap flex-none">
                         Build & Flash All
                     </button>
                 </div>
@@ -150,7 +153,7 @@
                                         </span>
                                         <button v-if="dev.method === 'can' || dev.method === 'serial'" 
                                                 @click="rebootDevice(dev.id, (dev.status === 'ready' || dev.status === 'dfu') ? 'regular' : 'katapult', dev.method)" 
-                                                :disabled="flashing"
+                                                :disabled="flashing || printing"
                                                 class="transition-colors flex items-center justify-center w-4 h-4"
                                                 :class="(dev.status === 'ready' || dev.status === 'dfu') ? 'text-blue-400 hover:text-blue-300' : 'text-gray-500 hover:text-blue-400'"
                                                 :title="(dev.status === 'ready' || dev.status === 'dfu') ? 'Restart to Firmware' : (dev.method === 'serial' ? ('Reboot to DFU' + (dev.status === 'service' ? ' (stops services, device disconnects briefly)' : '')) : 'Reboot to Katapult')">
@@ -180,12 +183,12 @@
                                         <button @click="quickBuild(dev)" :disabled="building || flashing" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-1.5 rounded text-[10px] font-bold disabled:opacity-50 uppercase">
                                             Build
                                         </button>
-                                        <button @click="quickFlashOnly(dev)" :disabled="building || flashing" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-1.5 rounded text-[10px] font-bold disabled:opacity-50 uppercase">
+                                        <button @click="quickFlashOnly(dev)" :disabled="building || flashing || printing" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-1.5 rounded text-[10px] font-bold disabled:opacity-50 uppercase">
                                             Flash
                                         </button>
                                     </div>
                                     <div class="flex space-x-2">
-                                        <button @click="quickFlash(dev)" :disabled="building || flashing" class="flex-1 mainsail-btn text-white py-2 rounded text-sm font-bold disabled:opacity-50">
+                                        <button @click="quickFlash(dev)" :disabled="building || flashing || printing" class="flex-1 mainsail-btn text-white py-2 rounded text-sm font-bold disabled:opacity-50">
                                             Build & Flash
                                         </button>
                                         <button v-if="dev.profile" @click="buildAndDownload(dev.profile)" :disabled="building || flashing" class="bg-gray-700 hover:bg-gray-600 text-white p-2 rounded flex items-center justify-center" title="Build & Download Binary">
@@ -327,6 +330,7 @@
                                     </div>
                                     <div class="flex items-center space-x-2 flex-none ml-2">
                                         <button @click="rebootDevice(dev.id, dev.mode === 'ready' ? 'regular' : 'katapult', 'serial')" 
+                                                :disabled="flashing || printing"
                                                 class="text-xs transition-colors"
                                                 :class="dev.mode === 'ready' ? 'text-blue-400 hover:text-blue-300' : 'text-gray-500 hover:text-blue-400'"
                                                 :title="dev.mode === 'ready' ? 'Restart to Firmware' : 'Reboot to DFU'">
@@ -358,6 +362,7 @@
                                     </div>
                                     <div class="flex items-center space-x-2 flex-none ml-2">
                                         <button @click="rebootDevice(dev.id, dev.mode === 'ready' ? 'regular' : 'katapult', 'can')" 
+                                                :disabled="flashing || printing"
                                                 class="text-xs transition-colors"
                                                 :class="dev.mode === 'ready' ? 'text-blue-400 hover:text-blue-300' : 'text-gray-500 hover:text-blue-400'"
                                                 :title="dev.mode === 'ready' ? 'Restart to Firmware' : 'Reboot to Katapult'">
@@ -381,7 +386,7 @@
                                         </div>
                                     </div>
                                     <div class="flex items-center space-x-2">
-                                        <button @click="rebootDevice(dev.id, 'regular', 'dfu')" class="text-green-400 hover:text-green-300 text-xs" title="Attempt Restart to Firmware">
+                                        <button @click="rebootDevice(dev.id, 'regular', 'dfu')" :disabled="flashing || printing" class="text-green-400 hover:text-green-300 text-xs" title="Attempt Restart to Firmware">
                                             <i class="fas fa-power-off"></i>
                                         </button>
                                         <button @click="attachToFleet(dev, 'dfu')" class="text-orange-400 hover:text-orange-300 text-xs" title="Attach to existing fleet device">
@@ -513,7 +518,7 @@
                                                 <span class="text-[9px] bg-orange-900/30 text-orange-300 px-1.5 py-0.5 rounded border border-orange-500/20 font-bold uppercase tracking-tighter">DFU</span>
                                             </div>
                                             <button @click="testMagicBaud(dev)" 
-                                                    :disabled="flashing"
+                                                    :disabled="flashing || printing"
                                                     class="text-[9px] bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-0.5 rounded border border-gray-600 font-bold uppercase transition-colors disabled:opacity-50"
                                                     :class="{'border-green-500 text-green-400': dev.magic_baud_tested && dev.dfu_status !== 'ready', 'border-orange-500 text-orange-400': dev.dfu_status === 'ready'}"
                                                     title="Test the full DFU entry/exit cycle">
@@ -523,7 +528,7 @@
 
                                             <button v-if="dev.dfu_status === 'ready'"
                                                     @click="rebootDevice(dev.dfu_id, 'regular', 'dfu')" 
-                                                    :disabled="flashing"
+                                                    :disabled="flashing || printing"
                                                     class="text-[9px] bg-gray-700 hover:bg-gray-600 text-gray-300 px-2 py-0.5 rounded border border-gray-600 font-bold uppercase transition-colors disabled:opacity-50"
                                                     title="Attempt restart to firmware">
                                                 <i class="fas fa-redo"></i> 
@@ -684,6 +689,9 @@
                 const flashing = ref(false);
                 const updating = ref(false);
                 const querying = ref(false);
+                const printing = ref(false);
+                const printState = ref('');
+                const printFilename = ref('');
                 const buildLogs = ref("");
                 const currentTaskId = ref(null);
                 const taskCancelled = ref(false);
@@ -963,6 +971,19 @@
                     if (now - lastFleetFetch < 2000) return; // 2 second throttle
                     lastFleetFetch = now;
                     await fetchFleet(false);
+                };
+
+                const fetchPrintStatus = async () => {
+                    try {
+                        const res = await fetch('/api/print_status');
+                        const data = await res.json();
+                        printing.value = data.printing;
+                        printState.value = data.state;
+                        printFilename.value = data.filename;
+                    } catch (e) {
+                        // If Moonraker is unreachable, assume not printing
+                        printing.value = false;
+                    }
                 };
 
                 const fetchServices = async () => {
@@ -1603,6 +1624,7 @@
                     fetchProfiles().then(() => fetchProfileInfo());
                     fetchFleet();
                     fetchServices();
+                    fetchPrintStatus();
                     discoverDevices();
                     fetchSystemStatus();
                     
@@ -1626,6 +1648,18 @@
                             if (serviceErrors >= 5) {
                                 clearInterval(serviceInterval);
                                 console.warn('Service polling stopped after repeated failures');
+                            }
+                        });
+                    }, 10000);
+
+                    // Refresh print status every 10 seconds (with error backoff)
+                    let printErrors = 0;
+                    let printInterval = setInterval(() => {
+                        fetchPrintStatus().then(() => { printErrors = 0; }).catch(() => {
+                            printErrors++;
+                            if (printErrors >= 5) {
+                                clearInterval(printInterval);
+                                console.warn('Print status polling stopped after repeated failures');
                             }
                         });
                     }, 10000);
@@ -1655,7 +1689,7 @@
                 };
 
                 return { 
-                    view, sidebarOpen, configTree, profiles, fleet, selectedProfile, loading, building, flashing, updating, querying,
+                    view, sidebarOpen, configTree, profiles, fleet, selectedProfile, loading, building, flashing, updating, querying, printing, printState, printFilename,
                     buildLogs, formattedLogs, expandLogs, expandLogsHeight, updateValue, saveProfile, saveProfileAs, newProfile, deleteProfile, renameProfile, loadProfile, createMissingProfile, startBuild, runBatch, selfUpdate,
                     devices, selectedDevice, discoverDevices, startFlash, quickFlash, quickBuild, quickFlashOnly, buildAndDownload, rebootDevice, statusColor, formatStatus,
                     addDeviceToFleet, attachToFleet, updateFleetDevice, onDeviceProfileChange, removeDeviceFromFleet, error, modifiedValues, formatNotes,

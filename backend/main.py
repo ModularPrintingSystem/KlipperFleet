@@ -234,6 +234,11 @@ async def get_status() -> Dict[str, Any]:
         "is_klipper_kconfiglib": kconfig_mgr.is_klipper_kconfiglib
     }
 
+@app.get("/api/print_status")
+async def get_print_status() -> Dict[str, Any]:
+    """Returns whether any printer is currently printing (via Moonraker)."""
+    return await flash_mgr.check_printer_printing()
+
 @app.get("/klipper/version")
 @app.get("/firmware/version")
 async def get_klipper_version() -> Dict[str, str]:
@@ -518,6 +523,18 @@ async def batch_operation(action: str, background_tasks: BackgroundTasks) -> Dic
             # 2. Flash phase
             if "flash" in action:
                 if task_store.is_cancelled(task_id): return
+
+                # Safety: refuse to flash while a print is in progress
+                print_status = await flash_mgr.check_printer_printing()
+                if print_status["printing"]:
+                    task_store.add_log(
+                        task_id,
+                        f"\n!!! BATCH FLASH ABORTED: Printer is currently {print_status['state']}"
+                        f" (file: {print_status['filename']}). Cannot flash during a print.\n"
+                    )
+                    task_store.complete_task(task_id)
+                    return
+
                 task_store.tasks[task_id]["is_bus_task"] = True
                 task_store.add_log(task_id, "\n>>> BATCH FLASH: Starting...\n")
                 
@@ -1061,6 +1078,15 @@ async def discover_devices() -> Dict[str, List[Dict[str, Any]]]:
 @app.post("/flash")
 async def flash_device(req: FlashRequest) -> StreamingResponse:
     """Flashes the specified profile to a device."""
+    # Safety: refuse to flash while a print is in progress
+    print_status = await flash_mgr.check_printer_printing()
+    if print_status["printing"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot flash while printing is in progress (state: {print_status['state']}, file: {print_status['filename']}). "
+                   "Wait for the print to finish or cancel it first."
+        )
+
     task_id: str = f"task_{uuid.uuid4().hex[:12]}"
     task_store.create_task(task_id)
     task_store.tasks[task_id]["is_bus_task"] = True
@@ -1255,6 +1281,15 @@ async def flash_device(req: FlashRequest) -> StreamingResponse:
 @app.post("/flash/reboot")
 async def reboot_device(device_id: str, mode: str = "katapult", method: Optional[str] = None) -> StreamingResponse:
     """Reboots a device."""
+    # Safety: refuse to reboot while a print is in progress
+    print_status = await flash_mgr.check_printer_printing()
+    if print_status["printing"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reboot devices while printing is in progress (state: {print_status['state']}, file: {print_status['filename']}). "
+                   "Wait for the print to finish or cancel it first."
+        )
+
     task_id: str = f"task_{uuid.uuid4().hex[:12]}"
     task_store.create_task(task_id)
     task_store.tasks[task_id]["is_bus_task"] = True

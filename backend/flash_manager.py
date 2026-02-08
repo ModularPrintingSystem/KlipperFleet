@@ -304,6 +304,33 @@ class FlashManager:
             print(f"Error querying MCU versions: {e}")
         return versions
 
+    async def check_printer_printing(self) -> Dict[str, Any]:
+        """Queries Moonraker's print_stats to determine if a print is in progress.
+        
+        Returns a dict with:
+          - printing (bool): True if the printer is actively printing or paused.
+          - state (str): The raw print_stats state (e.g. 'printing', 'paused', 'standby', 'complete', 'error', 'unknown').
+          - filename (str): The filename being printed, if any.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response: httpx.Response = await client.get(
+                    "http://127.0.0.1:7125/printer/objects/query?print_stats", timeout=2.0
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    stats = data.get("result", {}).get("status", {}).get("print_stats", {})
+                    state = stats.get("state", "unknown")
+                    filename = stats.get("filename", "")
+                    return {
+                        "printing": state in ("printing", "paused"),
+                        "state": state,
+                        "filename": filename,
+                    }
+        except Exception:
+            pass
+        return {"printing": False, "state": "unknown", "filename": ""}
+
     async def trigger_firmware_restart(self) -> None:
         """Sends a FIRMWARE_RESTART command to Klipper via Moonraker."""
         try:
