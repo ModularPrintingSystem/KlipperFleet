@@ -52,8 +52,20 @@ class FlashManager:
             if os.path.exists(abs_id):
                 configured_lookup[os.path.realpath(abs_id)] = meta
 
+        # Also include serial devices explicitly configured in Moonraker/Klipper.
+        # This makes UART aliases like /dev/serial0 discoverable even on systems
+        # where only the configured alias is known reliably.
+        configured_serial_ids: List[str] = []
+        for configured_id in moonraker_mcus.keys():
+            if isinstance(configured_id, str) and configured_id.startswith("/dev/"):
+                configured_serial_ids.append(os.path.abspath(configured_id))
+
         # Combine and deduplicate while preserving order
-        all_candidates: List[str] = usb_devs + [os.path.abspath(d) for d in candidates if os.path.exists(d)]
+        all_candidates: List[str] = (
+            usb_devs
+            + [os.path.abspath(d) for d in candidates if os.path.exists(d)]
+            + configured_serial_ids
+        )
         all_devs: List[str] = []
         seen_ids: Set[str] = set()
         for dev in all_candidates:
