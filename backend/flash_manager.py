@@ -34,19 +34,41 @@ class FlashManager:
         # 2. Common UART and CDC-ACM devices
         # We include /dev/ttyACM* and /dev/ttyUSB* because some devices (especially in Katapult)
         # might not immediately get a by-id link or might be generic.
-        candidates: List[str] = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + ["/dev/ttyAMA0", "/dev/ttyS0"]
+        candidates: List[str] = (
+            glob.glob("/dev/ttyACM*")
+            + glob.glob("/dev/ttyUSB*")
+            + ["/dev/serial0", "/dev/serial1", "/dev/ttyAMA0", "/dev/ttyAMA1", "/dev/ttyS0", "/dev/ttyS1"]
+        )
         
-        moonraker_mcus = {}
+        moonraker_mcus: Dict[str, Dict[str, str]] = {}
         if not skip_moonraker:
-            moonraker_mcus: Dict[str, Dict[str, str]] = await self._get_moonraker_mcus()
+            moonraker_mcus = await self._get_moonraker_mcus()
         
-        # Combine and deduplicate
-        # We use absolute paths for everything
-        all_devs: List[str] = list(set(usb_devs + [os.path.abspath(d) for d in candidates if os.path.exists(d)]))
+        # Build a lookup keyed by both configured path and resolved real path
+        configured_lookup: Dict[str, Dict[str, str]] = {}
+        for configured_id, meta in moonraker_mcus.items():
+            abs_id = os.path.abspath(configured_id)
+            configured_lookup[abs_id] = meta
+            if os.path.exists(abs_id):
+                configured_lookup[os.path.realpath(abs_id)] = meta
+
+        # Combine and deduplicate while preserving order
+        all_candidates: List[str] = usb_devs + [os.path.abspath(d) for d in candidates if os.path.exists(d)]
+        all_devs: List[str] = []
+        seen_ids: Set[str] = set()
+        for dev in all_candidates:
+            if dev in seen_ids:
+                continue
+            seen_ids.add(dev)
+            all_devs.append(dev)
+
+        seen_real_paths: Set[str] = set()
         
         for dev in all_devs:
             name: str = os.path.basename(dev)
-            is_configured: bool = dev in moonraker_mcus
+            real_path: str = os.path.realpath(dev)
+            configured_meta: Optional[Dict[str, str]] = configured_lookup.get(dev) or configured_lookup.get(real_path)
+            is_configured: bool = configured_meta is not None
             
             # If it's a by-id device, it's almost certainly an MCU
             if dev.startswith("/dev/serial/by-id/"):
@@ -62,20 +84,16 @@ class FlashManager:
                     mode = "service"
                 
                 if is_configured:
-                    name = f"{moonraker_mcus[dev]['name']} ({name})"
+                    name = f"{configured_meta['name']} ({name})"
                 devices.append({"id": dev, "name": name, "type": "usb", "mode": mode})
+                seen_real_paths.add(real_path)
             
             # If it's a ttyACM/ttyUSB device, we show it if it's NOT already represented by a by-id link
             # or if it's configured in Klipper.
             elif dev.startswith("/dev/ttyACM") or dev.startswith("/dev/ttyUSB"):
                 # Check if this physical device is already in devices via by-id
                 # (This is a bit tricky, but usually by-id is a symlink to ttyACM/USB)
-                real_path: str = os.path.realpath(dev)
-                already_added = False
-                for d in devices:
-                    if os.path.realpath(d['id']) == real_path:
-                        already_added = True
-                        break
+                already_added = real_path in seen_real_paths
                 
                 if not already_added:
                     # For generic tty devices, we rely on is_configured or name hints
@@ -89,13 +107,24 @@ class FlashManager:
                         mode = "service"
                     
                     if is_configured:
-                        name = f"{moonraker_mcus[dev]['name']} ({name})"
+                        name = f"{configured_meta['name']} ({name})"
                     devices.append({"id": dev, "name": name, "type": "usb", "mode": mode})
+                    seen_real_paths.add(real_path)
 
-            # If it's a raw UART device, only show it if it's actually configured in Klipper
-            elif is_configured:
-                name = f"{moonraker_mcus[dev]['name']} ({name})"
-                devices.append({"id": dev, "name": name, "type": "uart", "mode": "service"})
+            # Raw UART aliases/ports on SBCs (e.g. Raspberry Pi serial0/AMA/S ports)
+            # are shown when configured, and also as discoverable UART endpoints.
+            elif (
+                dev.startswith("/dev/serial")
+                or dev.startswith("/dev/ttyAMA")
+                or dev.startswith("/dev/ttyS")
+            ):
+                if real_path in seen_real_paths:
+                    continue
+                mode = "service" if is_configured else "ready"
+                if is_configured:
+                    name = f"{configured_meta['name']} ({name})"
+                devices.append({"id": dev, "name": name, "type": "uart", "mode": mode})
+                seen_real_paths.add(real_path)
                 
         return devices
 
