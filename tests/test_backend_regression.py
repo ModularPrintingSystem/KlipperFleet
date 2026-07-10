@@ -991,3 +991,74 @@ class TestAvrProfileAutoDetection:
         assert info["mega"]["is_can_bridge"] is False
         assert info["spider"]["is_avr"] is False
         assert info["spider"]["is_can_bridge"] is True
+
+
+# ---------------------------------------------------------------------------
+# Mainsail redirect-shim self-heal
+# ---------------------------------------------------------------------------
+
+
+class TestMainsailShimHeal:
+    """_ensure_mainsail_shim redeploys /klipperfleet.html after Mainsail wipes it.
+
+    Mainsail clears its own web root on every self-update, deleting the shim,
+    while the navi.json entry pointing at it survives -> the sidebar link
+    reloads Mainsail instead of redirecting. Startup must re-heal it.
+    """
+
+    def _redirect_home(self, tmp_path, monkeypatch):
+        """Make ~ resolve to tmp_path so ~/mainsail is under our control."""
+        import backend.main as main
+        monkeypatch.setattr(
+            main.os.path, "expanduser",
+            lambda p: p.replace("~", str(tmp_path), 1) if p.startswith("~") else p,
+        )
+
+    def _shim_src(self):
+        import backend.main as main
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(main.__file__)))
+        with open(os.path.join(repo, "install_scripts", "klipperfleet.html")) as f:
+            return f.read()
+
+    @pytest.mark.asyncio
+    async def test_no_mainsail_root_is_noop(self, tmp_path, monkeypatch):
+        """No ~/mainsail dir -> nothing written, no crash."""
+        self._redirect_home(tmp_path, monkeypatch)
+        from backend.main import _ensure_mainsail_shim
+        await _ensure_mainsail_shim()
+        assert not (tmp_path / "mainsail" / "klipperfleet.html").exists()
+
+    @pytest.mark.asyncio
+    async def test_deploys_missing_shim(self, tmp_path, monkeypatch):
+        """Mainsail present but shim gone -> shim redeployed with source content."""
+        (tmp_path / "mainsail").mkdir()
+        self._redirect_home(tmp_path, monkeypatch)
+        from backend.main import _ensure_mainsail_shim
+        await _ensure_mainsail_shim()
+        dst = tmp_path / "mainsail" / "klipperfleet.html"
+        assert dst.exists()
+        assert dst.read_text() == self._shim_src()
+
+    @pytest.mark.asyncio
+    async def test_overwrites_stale_shim(self, tmp_path, monkeypatch):
+        """A stale/corrupted shim is replaced with the current source."""
+        (tmp_path / "mainsail").mkdir()
+        dst = tmp_path / "mainsail" / "klipperfleet.html"
+        dst.write_text("<html>old broken shim</html>")
+        self._redirect_home(tmp_path, monkeypatch)
+        from backend.main import _ensure_mainsail_shim
+        await _ensure_mainsail_shim()
+        assert dst.read_text() == self._shim_src()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_current(self, tmp_path, monkeypatch):
+        """An already-correct shim is left untouched (no needless rewrite)."""
+        (tmp_path / "mainsail").mkdir()
+        dst = tmp_path / "mainsail" / "klipperfleet.html"
+        dst.write_text(self._shim_src())
+        mtime_before = dst.stat().st_mtime_ns
+        self._redirect_home(tmp_path, monkeypatch)
+        from backend.main import _ensure_mainsail_shim
+        await _ensure_mainsail_shim()
+        assert dst.stat().st_mtime_ns == mtime_before
+        assert dst.read_text() == self._shim_src()

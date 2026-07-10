@@ -41,6 +41,7 @@ except Exception:
 async def lifespan(application: FastAPI):
     """Startup / shutdown hooks for KlipperFleet."""
     await _migrate_moonraker_conf()
+    await _ensure_mainsail_shim()
     await _ensure_sudoers()
     await _ensure_system_deps()
     await _ensure_vendor_assets()
@@ -151,6 +152,32 @@ async def _migrate_moonraker_conf() -> None:
         logger.debug(
             'moonraker.conf migration check skipped (non-fatal)', exc_info=True
         )
+
+
+async def _ensure_mainsail_shim() -> None:
+    """Redeploy the /klipperfleet.html redirect shim into Mainsail's web root.
+
+    The shim lives inside Mainsail's own directory, which Mainsail wipes on every
+    self-update — while the navi.json entry pointing at it survives. Without this,
+    the sidebar link falls through to Mainsail's SPA router and just reloads
+    Mainsail. install.sh only runs on install, so we re-heal it on every startup.
+    """
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = os.path.join(repo_dir, 'install_scripts', 'klipperfleet.html')
+    mainsail_root = os.path.expanduser('~/mainsail')
+    dst = os.path.join(mainsail_root, 'klipperfleet.html')
+    try:
+        if not os.path.isdir(mainsail_root):
+            return  # Mainsail not installed here; nothing to heal.
+        want = open(src, encoding='utf-8').read()
+        have = open(dst, encoding='utf-8').read() if os.path.isfile(dst) else None
+        if want != have:
+            with open(dst, 'w', encoding='utf-8') as f:
+                f.write(want)
+            os.chmod(dst, 0o644)
+            logger.info('Redeployed KlipperFleet redirect shim into Mainsail web root.')
+    except Exception:
+        logger.debug('Mainsail shim heal skipped (non-fatal)', exc_info=True)
 
 
 async def _ensure_sudoers() -> None:
