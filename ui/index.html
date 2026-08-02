@@ -1143,22 +1143,7 @@
 
                 const applyFleetSnapshot = (snapshot, requestMutationVersion) => {
                     if (requestMutationVersion !== fleetMutationVersion) return false;
-                    const currentById = new Map(fleet.value.map(dev => [dev.id, dev]));
-                    fleet.value = snapshot.map(dev => {
-                        const current = currentById.get(dev.id);
-                        if (!current) return dev;
-                        const merged = { ...dev };
-                        if (merged.exclude_from_build === undefined) {
-                            merged.exclude_from_build = !!current.exclude_from_build;
-                        }
-                        if (merged.exclude_from_batch === undefined) {
-                            merged.exclude_from_batch = !!current.exclude_from_batch;
-                        }
-                        if (merged.exclude_from_build) {
-                            merged.exclude_from_batch = true;
-                        }
-                        return merged;
-                    });
+                    fleet.value = snapshot;
                     return true;
                 };
 
@@ -1922,9 +1907,9 @@
                         const res = await fetch('/fleet/device', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            cache: 'no-store',
                             body: JSON.stringify(payload)
                         });
+                        fleetMutationVersion++;
                         if (!res.ok) throw new Error("Failed to update device");
                         if (payload.old_id) {
                             dev._oldId = dev.id;
