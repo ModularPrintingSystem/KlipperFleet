@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import glob
+import time
 import httpx
 import logging
 from typing import List, Dict, AsyncGenerator, Optional, Any, Set
@@ -1752,14 +1753,36 @@ class FlashManager:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        while True:
-            if process.stdout is None:
+        # An unreachable target (e.g. a CAN UUID that does not exist on the bus)
+        # leaves flashtool.py waiting forever, so bound it the same way builds are.
+        flash_timeout_s = 600  # 10 minutes total
+        stall_timeout_s = 120  # 2 minutes without output
+        start_time = time.monotonic()
+        timed_out_msg: Optional[str] = None
+        while process.stdout is not None:
+            if time.monotonic() - start_time > flash_timeout_s:
+                timed_out_msg = f'timed out after {flash_timeout_s}s'
                 break
-            # Read in chunks to handle progress bars (\r)
-            chunk: bytes = await process.stdout.read(128)
+            try:
+                # Read in chunks to handle progress bars (\r)
+                chunk: bytes = await asyncio.wait_for(
+                    process.stdout.read(128), timeout=stall_timeout_s
+                )
+            except asyncio.TimeoutError:
+                timed_out_msg = f'stalled (no output for {stall_timeout_s}s)'
+                break
             if not chunk:
                 break
             yield chunk.decode(errors='replace')
+
+        if timed_out_msg:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            yield f'>>> Flashing {timed_out_msg}. Check that the device is on the bus and the ID is correct.\n'
+            return
 
         await process.wait()
         if process.returncode in ok_returncodes:

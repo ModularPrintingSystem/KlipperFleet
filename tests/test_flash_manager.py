@@ -600,3 +600,24 @@ class TestPostFlashRescan:
         ]
         # Old path still present — nothing changed
         assert old_device_id in current_ids
+
+
+class TestFlashCommandTimeout:
+    """A flash target that never responds (e.g. a bogus CAN UUID) must not hang forever."""
+
+    @pytest.mark.asyncio
+    async def test_stalled_flash_is_killed_and_reported(self):
+        fm = FlashManager("/tmp/klipper", "/tmp/katapult")
+
+        proc = MagicMock()
+        proc.stdout = MagicMock()
+        proc.wait = AsyncMock(return_value=-9)
+        proc.kill = MagicMock()
+
+        # wait_for raising TimeoutError == flashtool.py sitting silent on a dead UUID.
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),              patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError)):
+            out = "".join([line async for line in fm._run_flash_command(["true"])])
+
+        proc.kill.assert_called_once()
+        assert "stalled" in out
+        assert ">>> Flashing successful!" not in out
