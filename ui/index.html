@@ -1818,6 +1818,7 @@
                     const originalFleet = JSON.parse(JSON.stringify(fleet.value));
 
                     // Optimistic UI update: add fleet card immediately and mark device as managed in discovery
+                    fleetMutationVersion++;
                     fleet.value.push(newDevice);
 
                     ['beacon', 'serial', 'can', 'dfu', 'linux'].forEach(category => {
@@ -1835,6 +1836,7 @@
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify(newDevice)
                             });
+                            fleetMutationVersion++;
                         } catch (fetchError) {
                             throw new Error("Network error: " + fetchError.message);
                         }
@@ -1951,6 +1953,7 @@
                     const originalDevices = JSON.parse(JSON.stringify(devices.value));
 
                     // Optimistic UI update: immediately remove from fleet
+                    fleetMutationVersion++;
                     const idx = fleet.value.findIndex(d => d.id === id);
                     if (idx >= 0) {
                         fleet.value.splice(idx, 1);
@@ -1970,6 +1973,7 @@
                         let res;
                         try {
                             res = await fetch(`/fleet/device?device_id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+                            fleetMutationVersion++;
                         } catch (fetchError) {
                             // Network error (failed to fetch, timeout, etc)
                             throw new Error("Network error: " + fetchError.message);
